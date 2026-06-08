@@ -18,6 +18,7 @@
  */
 
 #include <sys/stat.h>
+#include <string.h>
 #include <time.h>
 
 #include <libplacebo/colorspace.h>
@@ -673,6 +674,12 @@ static void hwdec_release(pl_gpu gpu, struct pl_frame *frame)
     }
 
     ra_hwdec_mapper_unmap(p->hwdec_mapper);
+}
+
+static bool xr_resident_enabled(void)
+{
+    const char *value = getenv("XR_RESIDENT");
+    return value && strcmp(value, "1") == 0;
 }
 
 static bool format_supported(struct vo *vo, int format, bool use_uint)
@@ -1497,6 +1504,30 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
 
     p->is_interpolated = pts_offset != 0 && mix.num_frames > 1;
     valid = true;
+
+#if defined(__APPLE__) && HAVE_VULKAN
+    // [xr] 常驻纹理出口:把当前帧同样渲染到一张常驻 IOSurface 纹理(由 XR_RESIDENT gate)。
+    // 复用 swapchain target 的几何/色彩设置,仅替换目标纹理。上面的窗口路径不受影响。
+    if (xr_resident_enabled()) {
+        extern pl_tex xr_resident_get(struct mp_log *log, pl_gpu gpu, int w, int h, uint32_t *out_id);
+        extern bool xr_resident_check_nonzero(struct mp_log *log, pl_gpu gpu);
+        uint32_t iosid = 0;
+        pl_tex rtex = xr_resident_get(vo->log, gpu, swframe.fbo->params.w,
+                                      swframe.fbo->params.h, &iosid);
+        if (rtex) {
+            struct pl_frame xr_target = target;
+            xr_target.planes[0].texture = rtex;
+            if (pl_render_image_mix(p->rr, &mix, &xr_target, &params)) {
+                // [xr] 验证夹具用粗同步:先证明 RealityKit 读到完整帧,再演进 fence/双缓冲。
+                pl_gpu_finish(gpu);
+                static int xr_count = 0;
+                if ((xr_count++ % 60) == 0)
+                    xr_resident_check_nonzero(vo->log, gpu);
+            }
+        }
+    }
+#endif
+
     // fall through
 
 done:
@@ -2248,6 +2279,18 @@ static int preinit(struct vo *vo)
     p->pllog = p->context->pllog;
     p->gpu = p->context->gpu;
     p->sw = p->context->swapchain;
+
+    // [xr] stage 1.0 probe: only run when the resident path is explicitly enabled.
+    if (xr_resident_enabled() && p->gpu) {
+        MP_INFO(vo, "[xr-probe] export.tex=0x%x import.tex=0x%x | "
+                    "export(MTL=%d IOSurf=%d) import(MTL=%d IOSurf=%d)\n",
+                (unsigned)p->gpu->export_caps.tex, (unsigned)p->gpu->import_caps.tex,
+                !!(p->gpu->export_caps.tex & PL_HANDLE_MTL_TEX),
+                !!(p->gpu->export_caps.tex & PL_HANDLE_IOSURFACE),
+                !!(p->gpu->import_caps.tex & PL_HANDLE_MTL_TEX),
+                !!(p->gpu->import_caps.tex & PL_HANDLE_IOSURFACE));
+    }
+
     p->hwdec_ctx = (struct ra_hwdec_ctx) {
         .log = p->log,
         .global = p->global,

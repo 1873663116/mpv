@@ -1663,7 +1663,8 @@ endif
 if features['cocoa'] and features['vulkan'] and features['swift']
     swift_sources += files('video/out/mac_common.swift',
                            'video/out/mac/metal_layer.swift')
-    sources += files('video/out/vulkan/context_mac.m')
+    sources += files('video/out/vulkan/context_mac.m',
+                     'video/out/vulkan/xr_resident_texture.m')
 endif
 
 macos_media_player = get_option('macos-media-player').require(
@@ -1823,7 +1824,8 @@ if get_option('libmpv')
                  description: 'mpv media player client library')
 
     headers = ['include/mpv/client.h', 'include/mpv/render.h',
-               'include/mpv/render_gl.h', 'include/mpv/stream_cb.h']
+               'include/mpv/render_gl.h', 'include/mpv/stream_cb.h',
+               'include/mpv/xr_resident.h']
     install_headers(headers, subdir: 'mpv')
 
     # Allow projects to build with libmpv by cloning into ./subprojects/mpv
