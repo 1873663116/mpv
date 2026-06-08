@@ -1,0 +1,5 @@
+module CMpv [system] {
+    header "../../../../include/mpv/client.h"
+    header "../../../../include/mpv/xr_resident.h"
+    export *
+}
