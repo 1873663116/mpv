@@ -1663,7 +1663,16 @@ endif
 if features['cocoa'] and features['vulkan'] and features['swift']
     swift_sources += files('video/out/mac_common.swift',
                            'video/out/mac/metal_layer.swift')
-    sources += files('video/out/vulkan/context_mac.m',
+    sources += files('video/out/vulkan/context_mac.m')
+endif
+
+# [xr] Enchron 常驻 IOSurface 出口:只依赖 vulkan + darwin(Metal/IOSurface),
+# 刻意不依赖 cocoa/swift —— visionOS 无 AppKit、打包时 swift-build 关闭,
+# 挂在 cocoa 守卫下会被整体编没(见 ADR 0004)。
+if features['vulkan'] and features['darwin']
+    dependencies += dependency('appleframeworks',
+                               modules: ['Metal', 'IOSurface', 'Foundation'])
+    sources += files('video/out/vulkan/context_mac_resident.m',
                      'video/out/vulkan/xr_resident_texture.m')
 endif
 

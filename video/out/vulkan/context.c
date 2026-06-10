@@ -146,10 +146,14 @@ struct priv {
 };
 
 static const struct ra_swapchain_fns vulkan_swapchain;
+static const struct ra_swapchain_fns headless_swapchain; // [xr] 无窗 IOSurface 出口
 
 struct mpvk_ctx *ra_vk_ctx_get(struct ra_ctx *ctx)
 {
-    if (!ctx->swapchain || ctx->swapchain->fns != &vulkan_swapchain)
+    // [xr] headless 上下文同样以 struct priv 持有 mpvk_ctx,一并识别。
+    if (!ctx->swapchain ||
+        (ctx->swapchain->fns != &vulkan_swapchain &&
+         ctx->swapchain->fns != &headless_swapchain))
         return NULL;
 
     struct priv *p = ctx->swapchain->priv;
@@ -450,6 +454,44 @@ bool ra_vk_ctx_init(struct ra_ctx *ctx, struct mpvk_ctx *vk,
     if (!vk->swapchain)
         goto error;
 
+    return true;
+
+error:
+    ra_vk_ctx_uninit(ctx);
+    return false;
+}
+
+// [xr] 无 fns 的 swapchain 壳:headless 上下文没有可呈现的 swapchain,
+// 但 vo_gpu_next 会读 ctx->swapchain->fns 的可选回调(color_depth/set_color/
+// get_vsync),全为 NULL 即走安全分支。start_frame/submit 由 resident 路径绕过。
+static const struct ra_swapchain_fns headless_swapchain = {0};
+
+// [xr] 只建设备 + ra,不建 surface/swapchain。用于 Enchron resident 出口:
+// mpv 渲染进外部 IOSurface,自身不向任何屏幕呈现(见 ADR 0003)。
+// 复用 ra_vk_ctx_uninit 清理(vk->swapchain 留 NULL,pl_swapchain_destroy 对 NULL 安全)。
+bool ra_vk_ctx_init_headless(struct ra_ctx *ctx, struct mpvk_ctx *vk,
+                             struct ra_ctx_params params)
+{
+    struct ra_swapchain *sw = ctx->swapchain = talloc_zero(NULL, struct ra_swapchain);
+    sw->ctx = ctx;
+    sw->fns = &headless_swapchain;
+
+    struct priv *p = sw->priv = talloc_zero(sw, struct priv);
+    p->vk = vk;
+    p->params = params;
+    p->opts = mp_get_config_group(p, ctx->global, &vulkan_conf);
+
+    vk->vulkan = mppl_create_vulkan(p->opts, vk->vkinst, vk->pllog,
+                                    VK_NULL_HANDLE, ctx->opts.allow_sw);
+    if (!vk->vulkan)
+        goto error;
+
+    vk->gpu = vk->vulkan->gpu;
+    ctx->ra = ra_create_pl(vk->gpu, ctx->log);
+    if (!ctx->ra)
+        goto error;
+
+    // vk->swapchain 故意留 NULL:无呈现链。
     return true;
 
 error:

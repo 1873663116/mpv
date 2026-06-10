@@ -50,6 +50,7 @@ extern const struct ra_ctx_fns ra_ctx_vulkan_xlib;
 extern const struct ra_ctx_fns ra_ctx_vulkan_android;
 extern const struct ra_ctx_fns ra_ctx_vulkan_display;
 extern const struct ra_ctx_fns ra_ctx_vulkan_mac;
+extern const struct ra_ctx_fns ra_ctx_vulkan_mac_resident; // [xr] 无窗 IOSurface 出口
 
 /* Direct3D 11 */
 extern const struct ra_ctx_fns ra_ctx_d3d11;
@@ -95,6 +96,11 @@ static const struct ra_ctx_fns *const contexts[] = {
 #endif
 #if HAVE_COCOA && HAVE_SWIFT
     &ra_ctx_vulkan_mac,
+#endif
+#ifdef __APPLE__
+    // [xr] 不参与 auto 探测,仅 --gpu-context=macvk_resident 显式选用。
+    // 守卫与 cocoa/swift 解耦:visionOS(无 AppKit)也要保留此出口(ADR 0004)。
+    &ra_ctx_vulkan_mac_resident,
 #endif
 #endif
 

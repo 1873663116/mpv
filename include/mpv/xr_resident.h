@@ -16,14 +16,17 @@
 extern "C" {
 #endif
 
-MPV_EXPORT bool xr_resident_configure_external_iosurface(uint32_t iosurface_id,
-                                                         int width,
-                                                         int height);
+// 模式开关:沉浸=true(渲染进 IOSurface)、窗口=false(走原 mpv 窗口路径)。
+// 线程安全,可在运行时热切;替代早期的 XR_RESIDENT 环境变量。
+MPV_EXPORT void xr_resident_set_enabled(bool enabled);
+// 门① 双缓冲:注册 1~2 张外部 IOSurface 组成写/读环(见 ADR 0003)。
+MPV_EXPORT bool xr_resident_configure_external_iosurfaces(const uint32_t *ids,
+                                                          int count,
+                                                          int width,
+                                                          int height);
+// 消费方每帧查询:最新「写完并发布」的 IOSurfaceID(读它绝不撕裂)。
+MPV_EXPORT uint32_t xr_resident_front_iosurface_id(void);
 MPV_EXPORT void xr_resident_clear_external_iosurface(void);
-MPV_EXPORT bool xr_resident_get_info(uint32_t *iosurface_id,
-                                     int *width,
-                                     int *height,
-                                     bool *uses_external_iosurface);
 
 #ifdef __cplusplus
 }

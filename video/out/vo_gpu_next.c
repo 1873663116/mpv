@@ -18,7 +18,6 @@
  */
 
 #include <sys/stat.h>
-#include <string.h>
 #include <time.h>
 
 #include <libplacebo/colorspace.h>
@@ -676,11 +675,9 @@ static void hwdec_release(pl_gpu gpu, struct pl_frame *frame)
     ra_hwdec_mapper_unmap(p->hwdec_mapper);
 }
 
-static bool xr_resident_enabled(void)
-{
-    const char *value = getenv("XR_RESIDENT");
-    return value && strcmp(value, "1") == 0;
-}
+// [xr] 模式开关:定义在 xr_resident_texture.m,用原子标志(非环境变量),
+// 可被 Swift 跨线程安全地在窗口/沉浸间切换。
+extern bool xr_resident_enabled(void);
 
 static bool format_supported(struct vo *vo, int format, bool use_uint)
 {
@@ -1047,7 +1044,8 @@ static bool set_colorspace_hint(struct priv *p, struct pl_color_space *hint)
             return true;
         }
     }
-    pl_swapchain_colorspace_hint(p->sw, hint);
+    if (p->sw) // [xr] headless 无 swapchain,跳过呈现链色彩提示
+        pl_swapchain_colorspace_hint(p->sw, hint);
     return false;
 }
 
@@ -1294,6 +1292,44 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
     }
 
     struct pl_swapchain_frame swframe;
+#if defined(__APPLE__) && HAVE_VULKAN
+    // [xr] 无窗 surfaceless 出口(macvk_resident):没有 swapchain,渲染目标直接是
+    // 外部导入的 IOSurface 纹理。让它冒充一帧 swapchain frame,下游渲染管线与窗口
+    // 路径完全一致(见 ADR 0003 落地步骤 B)。
+    bool xr_surfaceless = !p->sw && xr_resident_enabled();
+    uint32_t xr_back_id = 0; // 本帧写入的后台缓冲 IOSurfaceID,渲染后据此发布 front
+    if (!p->sw && !xr_surfaceless) {
+        // [xr] 防御:headless 上下文但出口未启用 → 无任何渲染目标。丢帧,
+        // 避免走进下方 headless_swapchain 的 NULL start_frame(空指针调用)。
+        MP_VERBOSE(vo, "[xr] headless 上下文但 resident 出口未启用,丢帧\n");
+        return VO_FALSE;
+    }
+    if (xr_surfaceless) {
+        extern pl_tex xr_resident_back_tex(struct mp_log *log, pl_gpu gpu, int w, int h, uint32_t *out_id);
+        extern bool xr_resident_external_size(int *w, int *h);
+        int rw = 0, rh = 0;
+        if (!xr_resident_external_size(&rw, &rh)) {
+            // 防御:启用了出口但没配置外部 IOSurface,回落到视频尺寸、内部自建缓冲。
+            rw = vo->dwidth;
+            rh = vo->dheight;
+        }
+        if (rw <= 0 || rh <= 0) {
+            MP_ERR(vo, "[xr] surfaceless 渲染目标尺寸无效 %dx%d\n", rw, rh);
+            return VO_FALSE;
+        }
+        // 取「后台缓冲」(双缓冲环里非 front 的那张),渲染进它。
+        pl_tex rtex = xr_resident_back_tex(vo->log, gpu, rw, rh, &xr_back_id);
+        if (!rtex)
+            return VO_FALSE;
+        swframe = (struct pl_swapchain_frame){
+            .fbo = rtex,
+            .flipped = false,
+            .color_repr = pl_color_repr_rgb,
+            .color_space = pl_color_space_srgb,
+        };
+    } else
+#endif
+    {
     bool should_draw = sw->fns->start_frame(sw, NULL); // for wayland logic
     if (!should_draw || !pl_swapchain_start_frame(p->sw, &swframe)) {
         if (frame->current) {
@@ -1307,6 +1343,7 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
             pl_queue_update(p->queue, NULL, &qparams);
         }
         return VO_FALSE;
+    }
     }
 
     bool valid = false;
@@ -1506,25 +1543,18 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
     valid = true;
 
 #if defined(__APPLE__) && HAVE_VULKAN
-    // [xr] 常驻纹理出口:把当前帧同样渲染到一张常驻 IOSurface 纹理(由 XR_RESIDENT gate)。
-    // 复用 swapchain target 的几何/色彩设置,仅替换目标纹理。上面的窗口路径不受影响。
-    if (xr_resident_enabled()) {
-        extern pl_tex xr_resident_get(struct mp_log *log, pl_gpu gpu, int w, int h, uint32_t *out_id);
+    // [xr] 常驻纹理出口(surfaceless / macvk_resident):主渲染已直接写入后台 IOSurface。
+    // 完成屏障保证写入结束 → 发布为 front;mpv 下一帧改写另一张,消费方只读 front,
+    // 故无撕裂(门①双缓冲,ADR 0003 步骤 D)。注:此处仍是 pl_gpu_finish 全停屏障,
+    // 异步跨设备 fence 是后续优化。
+    if (xr_surfaceless) {
+        extern void xr_resident_publish_front(uint32_t iosurface_id);
         extern bool xr_resident_check_nonzero(struct mp_log *log, pl_gpu gpu);
-        uint32_t iosid = 0;
-        pl_tex rtex = xr_resident_get(vo->log, gpu, swframe.fbo->params.w,
-                                      swframe.fbo->params.h, &iosid);
-        if (rtex) {
-            struct pl_frame xr_target = target;
-            xr_target.planes[0].texture = rtex;
-            if (pl_render_image_mix(p->rr, &mix, &xr_target, &params)) {
-                // [xr] 验证夹具用粗同步:先证明 RealityKit 读到完整帧,再演进 fence/双缓冲。
-                pl_gpu_finish(gpu);
-                static int xr_count = 0;
-                if ((xr_count++ % 60) == 0)
-                    xr_resident_check_nonzero(vo->log, gpu);
-            }
-        }
+        pl_gpu_finish(gpu);
+        xr_resident_publish_front(xr_back_id);
+        static int xr_count_sl = 0;
+        if ((xr_count_sl++ % 60) == 0)
+            xr_resident_check_nonzero(vo->log, gpu);
     }
 #endif
 
@@ -1543,6 +1573,11 @@ static void flip_page(struct vo *vo)
 {
     struct priv *p = vo->priv;
     struct ra_swapchain *sw = p->ra_ctx->swapchain;
+
+    // [xr] headless 无呈现链:IOSurface 已在 draw_frame 写完,无 swapchain 可提交,
+    // 且 headless_swapchain 无 swap_buffers 回调,提前返回。
+    if (!p->sw)
+        return;
 
     if (p->frame_pending) {
         if (!pl_swapchain_submit_frame(p->sw))
@@ -2206,6 +2241,16 @@ static void uninit(struct vo *vo)
     if (p->gpu)
         pl_gpu_finish(p->gpu);
 
+#if defined(__APPLE__) && HAVE_VULKAN
+    // [xr] 常驻 IOSurface 纹理绑定在即将销毁的 gpu 上,必须在此释放;否则热切
+    // 回沉浸模式时会复用绑在已死 gpu 上的悬空纹理(见 ADR 0003)。
+    // 无条件销毁(空环为 no-op):不依赖 enabled 开关的设置时序(ADR 0004)。
+    if (p->gpu) {
+        extern void xr_resident_destroy(pl_gpu gpu);
+        xr_resident_destroy(p->gpu);
+    }
+#endif
+
     pl_queue_destroy(&p->queue); // destroy this first
     for (int i = 0; i < MP_ARRAY_SIZE(p->osd_state.entries); i++)
         pl_tex_destroy(p->gpu, &p->osd_state.entries[i].tex);
@@ -2280,6 +2325,7 @@ static int preinit(struct vo *vo)
     p->gpu = p->context->gpu;
     p->sw = p->context->swapchain;
 
+#if defined(__APPLE__) && HAVE_VULKAN
     // [xr] stage 1.0 probe: only run when the resident path is explicitly enabled.
     if (xr_resident_enabled() && p->gpu) {
         MP_INFO(vo, "[xr-probe] export.tex=0x%x import.tex=0x%x | "
@@ -2290,6 +2336,7 @@ static int preinit(struct vo *vo)
                 !!(p->gpu->import_caps.tex & PL_HANDLE_MTL_TEX),
                 !!(p->gpu->import_caps.tex & PL_HANDLE_IOSURFACE));
     }
+#endif
 
     p->hwdec_ctx = (struct ra_hwdec_ctx) {
         .log = p->log,

@@ -9,6 +9,10 @@ bool ra_vk_ctx_init(struct ra_ctx *ctx, struct mpvk_ctx *vk,
                     struct ra_ctx_params params,
                     VkPresentModeKHR preferred_mode);
 
+// [xr] Enchron fork:只建设备+ra、不建 surface/swapchain 的 headless 变体。
+bool ra_vk_ctx_init_headless(struct ra_ctx *ctx, struct mpvk_ctx *vk,
+                             struct ra_ctx_params params);
+
 // Helper for initializing mpvk_ctx->vulkan
 pl_vulkan mppl_create_vulkan(struct vulkan_opts *opts,
                              pl_vk_inst vkinst,
