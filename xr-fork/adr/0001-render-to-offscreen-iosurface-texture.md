@@ -10,17 +10,11 @@ Enchron 是 visionOS 沉浸视频播放器,需要把视频帧作为纹理,贴到
 沉浸空间模型上(全景、虚拟影院等)。阶段 1 的 macOS 验证路径是
 IOSurface-backed `MTLTexture` → `TextureResource.__texture(from:)`。
 
-现状(集成方式):
-- 通过 **MPVKit**(预编译 SPM 二进制包)引入 libmpv,默认 `vo=gpu-next` + Vulkan/MoltenVK。
-- 拿纹理的方式是 **drawable-hack**:把 `CAMetalLayer` 指针经 `--wid` 交给 mpv,再子类化
-  `CAMetalLayer` 重写 `nextDrawable()` 偷出 `lastVendedDrawable`,用 CADisplayLink 轮询读取
-  `drawable.texture` 拷进 `LowLevelTexture`。
-- 另有 `vo=libmpv` 软渲染(`mpv_render_context_render` → CVPixelBuffer)作 fallback。
-
-平台事实:
-- libmpv 公开 render API 只有 `OPENGL` 和 `SW` 两种,**没有 Metal**;其 GPU backend 仅注册
-  OpenGL,且 visionOS 无 OpenGL。
-- mac/visionOS 上 `vo_gpu_next` 唯一 GPU 路径是 Vulkan → MoltenVK → CAMetalLayer。
+现状与平台事实:
+- 旧集成靠 **drawable-hack**(子类化 `CAMetalLayer` 偷 `nextDrawable()` 的纹理,CADisplayLink 轮询拷贝)
+  或 SW 软渲染 fallback —— 见「问题」与「替代方案」。
+- libmpv 公开 render API 只有 OpenGL / SW(无 Metal),且 visionOS 无 OpenGL;mac/visionOS 上
+  `vo_gpu_next` 唯一 GPU 路径是 Vulkan → MoltenVK → CAMetalLayer。
 
 ## 问题
 

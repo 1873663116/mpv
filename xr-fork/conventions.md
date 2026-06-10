@@ -15,8 +15,8 @@
 ## 命名约定
 
 - **代码符号**:跟随 mpv 既有风格(snake_case)。我们**新增的、对外可见**的符号(函数、选项)加
-  `xr_` 前缀(如 `xr_resident_texture_render`),便于和上游符号区分、rebase 时一眼认出我们的改动。
-  内部 static 符号不强制前缀,跟随 mpv。
+  `xr_` 前缀(如 `xr_resident_set_enabled`、`xr_resident_configure_external_iosurfaces`),
+  便于和上游符号区分、rebase 时一眼认出我们的改动。内部 static 符号不强制前缀,跟随 mpv。
 - **文件 / 目录**:我们自己的文件只放 `xr-fork/`,文件名用 kebab-case(如 `0001-xxx.md`)。
 - **文档 / 对话用词**:统一使用上方术语表的中文词,避免随口造词造成歧义。
 

@@ -3,64 +3,86 @@ import IOSurface
 import Metal
 import RealityKit
 
+/// 门① 双缓冲:持有 2 张 IOSurface(写/读环)。mpv 在两张间交替写后台缓冲、
+/// 写完发布为 front;本类按 mpv 发布的 front IOSurfaceID 取对应 TextureResource 给 RealityKit。
 @MainActor
 final class ResidentVideoSurface {
     static let width = 1280
     static let height = 720
+    static let bufferCount = 2
 
-    let iosurface: IOSurfaceRef
-    let iosurfaceID: UInt32
-    let metalTexture: any MTLTexture
-    private let textureResource: TextureResource
+    struct Buffer {
+        let iosurface: IOSurfaceRef
+        let id: UInt32
+        let metalTexture: any MTLTexture
+        let textureResource: TextureResource
+    }
+
+    let buffers: [Buffer]
+
+    var iosurfaceIDs: [UInt32] { buffers.map(\.id) }
 
     init() throws {
-        let properties: [CFString: Any] = [
-            kIOSurfaceWidth: Self.width,
-            kIOSurfaceHeight: Self.height,
-            kIOSurfaceBytesPerElement: 4,
-            kIOSurfacePixelFormat: UInt32(0x52474241),
-        ]
-
-        guard let iosurface = IOSurfaceCreate(properties as CFDictionary) else {
-            throw VerifyError("IOSurfaceCreate failed")
-        }
-
         guard let device = MTLCreateSystemDefaultDevice() else {
             throw VerifyError("MTLCreateSystemDefaultDevice failed")
         }
 
-        let descriptor = MTLTextureDescriptor.texture2DDescriptor(
-            pixelFormat: .rgba8Unorm,
-            width: Self.width,
-            height: Self.height,
-            mipmapped: false
-        )
-        descriptor.usage = [.renderTarget, .shaderRead]
-        descriptor.storageMode = .shared
+        var made: [Buffer] = []
+        for index in 0..<Self.bufferCount {
+            let properties: [CFString: Any] = [
+                kIOSurfaceWidth: Self.width,
+                kIOSurfaceHeight: Self.height,
+                kIOSurfaceBytesPerElement: 4,
+                kIOSurfacePixelFormat: UInt32(0x52474241),
+            ]
+            guard let iosurface = IOSurfaceCreate(properties as CFDictionary) else {
+                throw VerifyError("IOSurfaceCreate[\(index)] failed")
+            }
 
-        guard let metalTexture = device.makeTexture(
-            descriptor: descriptor,
-            iosurface: iosurface,
-            plane: 0
-        ) else {
-            throw VerifyError("MTLDevice.makeTexture(iosurface:) failed")
+            // _srgb 视图:mpv 写入的字节是 sRGB 非线性编码(出口契约,ADR 0004),
+            // RealityKit 在线性空间采样,必须由像素格式后缀声明解码;
+            // 同一 IOSurface 上 mpv 侧的渲染视图仍是 .rgba8Unorm,字节互不影响。
+            let descriptor = MTLTextureDescriptor.texture2DDescriptor(
+                pixelFormat: .rgba8Unorm_srgb,
+                width: Self.width,
+                height: Self.height,
+                mipmapped: false
+            )
+            descriptor.usage = [.renderTarget, .shaderRead]
+            descriptor.storageMode = .shared
+
+            guard let metalTexture = device.makeTexture(
+                descriptor: descriptor,
+                iosurface: iosurface,
+                plane: 0
+            ) else {
+                throw VerifyError("MTLDevice.makeTexture(iosurface:)[\(index)] failed")
+            }
+
+            made.append(Buffer(
+                iosurface: iosurface,
+                id: IOSurfaceGetID(iosurface),
+                metalTexture: metalTexture,
+                textureResource: TextureResource.__texture(from: metalTexture)
+            ))
         }
-
-        self.iosurface = iosurface
-        self.iosurfaceID = IOSurfaceGetID(iosurface)
-        self.metalTexture = metalTexture
-        self.textureResource = TextureResource.__texture(from: metalTexture)
+        buffers = made
     }
 
-    func makeTextureResource() -> TextureResource {
-        textureResource
+    func buffer(forID id: UInt32) -> Buffer? {
+        buffers.first { $0.id == id }
     }
 
-    func samplePixelSum() -> UInt64 {
+    /// RealityKit 初始挂载用的默认纹理(第 0 张)。
+    func initialTextureResource() -> TextureResource {
+        buffers[0].textureResource
+    }
+
+    func samplePixelSum(forID id: UInt32) -> UInt64 {
+        guard let buffer = buffer(forID: id) else { return 0 }
+        let iosurface = buffer.iosurface
         IOSurfaceLock(iosurface, .readOnly, nil)
-        defer {
-            IOSurfaceUnlock(iosurface, .readOnly, nil)
-        }
+        defer { IOSurfaceUnlock(iosurface, .readOnly, nil) }
 
         let base = IOSurfaceGetBaseAddress(iosurface)
         let bytes = base.assumingMemoryBound(to: UInt8.self)
