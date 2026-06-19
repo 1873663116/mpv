@@ -1,0 +1,66 @@
+name: VerifyVisionOS
+options:
+  bundleIdPrefix: com.enchron
+  deploymentTarget:
+    visionOS: "2.0"
+  createIntermediateGroups: true
+
+# 本地 MPVKit 包:其 Package.swift 已把 Libmpv target 指向本仓库本地构建的
+# Libmpv.xcframework(含常驻 IOSurface 出口),其余依赖用官方同版本远程 xcframework。
+packages:
+  MPVKit:
+    path: ../../../MPVKit
+  # RCP3 场景带脚本系统(Custom Components);参考预览 app(Xrplay_scene/Immersive Space)
+  # 正是靠这个包 + .scriptingSystem() 才能正确加载场景。照搬其 spec(main 分支)。
+  RealityKitScripting:
+    url: https://github.com/apple/realitykitscripting.git
+    branch: main
+
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    MARKETING_VERSION: "0.1"
+    CURRENT_PROJECT_VERSION: "1"
+
+targets:
+  VerifyVisionOS:
+    type: application
+    platform: visionOS
+    deploymentTarget: "2.0"
+    sources:
+      - path: Sources/App
+      # Resources/ 里的 .reality 场景与可选 sample.mp4 —— xcodegen 按类型归入 Copy Resources。
+      - path: Resources
+        buildPhase: resources
+        optional: true
+    dependencies:
+      - package: MPVKit
+        product: MPVKit
+      - package: RealityKitScripting
+        product: RealityKitScripting
+    info:
+      path: Info.plist
+      properties:
+        CFBundleDisplayName: mpv 纹理验证
+        # WindowGroup(控制窗)+ ImmersiveSpace(沉浸场景)是两个并存 scene。
+        # 缺这个键时系统按「单 scene」处理,openImmersiveSpace 直接被拒 ——
+        # 这正是「根本进不去沉浸场景」的根因(与沉浸模式 progressive/mixed/full 无关)。
+        UIApplicationSceneManifest:
+          UIApplicationSupportsMultipleScenes: true
+        # RCP 场景的 Script Graph 一进沉浸空间就开 ARKit 会话申请世界感知 + 手部追踪;
+        # visionOS 强制要求 Info.plist 里有对应用途说明字符串,缺了直接抛异常终止进程。
+        # 与参考 app(Xrplay_scene/Immersive Space)声明的同一组 key 对齐。
+        NSWorldSensingUsageDescription: 用于将视频屏锚定到你周围的空间。
+        NSHandsTrackingUsageDescription: 用于在沉浸场景中与视频屏交互。
+        NSAccessoryTrackingUsageDescription: 用于追踪可选的空间配件。
+        NSCameraUsageDescription: 用于沉浸场景的空间渲染。
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.enchron.VerifyVisionOS
+        CODE_SIGN_STYLE: Automatic
+        # 写在这里,xcodegen 每次重新生成工程都会带上,不会再被抹掉。
+        # 取你参考 app(Xrplay_scene/Immersive Space)真机在用的同一个 Team,避免每次 regenerate
+        # 把你 Xcode 里设的签名冲掉(之前 baked 的 75JYV857KD 是错的,才导致签名反复变)。
+        DEVELOPMENT_TEAM: JFLYK8F636
+        ENABLE_PREVIEWS: YES
+        SWIFT_VERSION: "5.0"

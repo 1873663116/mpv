@@ -13,7 +13,9 @@
  */
 
 #import <Metal/Metal.h>
-#import <IOSurface/IOSurface.h>
+// IOSurfaceRef.h(C API)在 macOS 与 visionOS 通用;伞头 <IOSurface/IOSurface.h>
+// 在 iOS/visionOS SDK 不公开,会编不过(只有 macOS 有)。
+#import <IOSurface/IOSurfaceRef.h>
 
 #include <pthread.h>
 #include <stdatomic.h>
@@ -71,7 +73,6 @@ struct xr_ext { uint32_t id; int w, h; };
 static struct xr_ext g_ext[XR_RING_MAX];
 static int g_count;        // 已配置的外部 IOSurface 数(0 = 无外部,走内部回落)
 static int g_write_idx;    // 下一帧写哪个环缓冲
-static int g_pub_idx = -1; // 最近发布的环缓冲索引(供自验抽样)
 static _Atomic uint32_t g_front_id; // 最新完整 IOSurfaceID(消费方读它)
 static _Atomic bool g_enabled; // 模式开关:沉浸=true、窗口=false(替代环境变量,线程安全)
 // 串行化 app 线程(configure/clear)与 VO 渲染线程(back_tex/publish/destroy)
@@ -87,7 +88,6 @@ bool xr_resident_enabled(void) { return atomic_load(&g_enabled); }
 void xr_resident_destroy(pl_gpu gpu);
 pl_tex xr_resident_back_tex(struct mp_log *log, pl_gpu gpu, int w, int h, uint32_t *out_id);
 void xr_resident_publish_front(uint32_t iosurface_id);
-bool xr_resident_check_nonzero(struct mp_log *log, pl_gpu gpu);
 bool xr_resident_external_size(int *w, int *h);
 
 static inline int xr_ring_count(void)
@@ -109,7 +109,10 @@ bool xr_resident_configure_external_iosurfaces(const uint32_t *ids, int count,
         if (!io)
             return false;
         bool ok = IOSurfaceGetWidth(io) == (size_t)width &&
-                  IOSurfaceGetHeight(io) == (size_t)height;
+                  IOSurfaceGetHeight(io) == (size_t)height &&
+                  // [xr] 像素格式必须是 fp16 RGBA(64RGBAHalf / 'RGhA'),与渲染目标
+                  // (RGBA16Float)及内部自建缓冲一致;否则绑定纹理会颜色错乱却不报错。
+                  IOSurfaceGetPixelFormat(io) == 0x52476841;
         CFRelease(io);
         if (!ok)
             return false;
@@ -120,7 +123,6 @@ bool xr_resident_configure_external_iosurfaces(const uint32_t *ids, int count,
     memcpy(g_ext, staged, sizeof(g_ext));
     g_count = count;
     g_write_idx = 0;
-    g_pub_idx = -1;
     atomic_store(&g_front_id, 0);
     pthread_mutex_unlock(&g_lock);
     return true;
@@ -132,7 +134,6 @@ void xr_resident_clear_external_iosurface(void)
     memset(g_ext, 0, sizeof(g_ext));
     g_count = 0;
     g_write_idx = 0;
-    g_pub_idx = -1;
     atomic_store(&g_front_id, 0);
     pthread_mutex_unlock(&g_lock);
 }
@@ -216,11 +217,14 @@ static bool xr_ensure_buf(struct mp_log *log, pl_gpu gpu, int idx, int w, int h)
         if (want_external) {
             io = IOSurfaceLookup(want_id);
         } else {
+            // [xr] HDR 出口(ADR 0005):fp16 RGBA(每像素 8 字节)承载扩展线性 Display P3。
+            // 外部 IOSurface 由 Swift 端以同格式创建(kCVPixelFormatType_64RGBAHalf);
+            // 这里的内部自建仅在「未配置外部 IOSurface」的回落路径用到,格式须与之一致。
             NSDictionary *props = @{
                 (id)kIOSurfaceWidth:           @(w),
                 (id)kIOSurfaceHeight:          @(h),
-                (id)kIOSurfaceBytesPerElement: @(4),
-                (id)kIOSurfacePixelFormat:     @(0x52474241), // 'RGBA'
+                (id)kIOSurfaceBytesPerElement: @(8),
+                (id)kIOSurfacePixelFormat:     @(0x52476841), // 'RGhA' = kCVPixelFormatType_64RGBAHalf
             };
             io = IOSurfaceCreate((CFDictionaryRef)props);
         }
@@ -231,7 +235,7 @@ static bool xr_ensure_buf(struct mp_log *log, pl_gpu gpu, int idx, int w, int h)
         }
 
         MTLTextureDescriptor *desc =
-            [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+            [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA16Float
                                                                width:w height:h mipmapped:NO];
         desc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
         desc.storageMode = MTLStorageModeShared;
@@ -242,9 +246,9 @@ static bool xr_ensure_buf(struct mp_log *log, pl_gpu gpu, int idx, int w, int h)
             return false;
         }
 
-        pl_fmt fmt = pl_find_fmt(gpu, PL_FMT_UNORM, 4, 8, 8, PL_FMT_CAP_RENDERABLE);
+        pl_fmt fmt = pl_find_fmt(gpu, PL_FMT_FLOAT, 4, 16, 16, PL_FMT_CAP_RENDERABLE);
         if (!fmt) {
-            mp_msg(log, MSGL_ERR, "[xr] 找不到 renderable rgba8 pl_fmt\n");
+            mp_msg(log, MSGL_ERR, "[xr] 找不到 renderable rgba16f pl_fmt\n");
             [mt release];
             CFRelease(io);
             return false;
@@ -300,35 +304,6 @@ void xr_resident_publish_front(uint32_t iosurface_id)
 {
     pthread_mutex_lock(&g_lock);
     atomic_store(&g_front_id, iosurface_id);
-    g_pub_idx = g_write_idx % xr_ring_count();
     g_write_idx = (g_write_idx + 1) % xr_ring_count();
     pthread_mutex_unlock(&g_lock);
-}
-
-// 自验:抽样「最近发布」的缓冲,确认确实画进了非空内容(每 N 帧调一次即可)。
-bool xr_resident_check_nonzero(struct mp_log *log, pl_gpu gpu)
-{
-    pthread_mutex_lock(&g_lock);
-    int idx = g_pub_idx >= 0 ? g_pub_idx : 0;
-    struct xr_buf *b = &g_res[idx];
-    if (!b->iosurf) {
-        pthread_mutex_unlock(&g_lock);
-        return false;
-    }
-    pl_gpu_finish(gpu); // 确保 GPU 写入完成后再 CPU 读
-    IOSurfaceLock(b->iosurf, kIOSurfaceLockReadOnly, NULL);
-    const uint8_t *base = IOSurfaceGetBaseAddress(b->iosurf);
-    size_t bpr = IOSurfaceGetBytesPerRow(b->iosurf);
-    unsigned long sum = 0;
-    for (int y = 0; y < b->h; y += 16) {
-        for (int x = 0; x < b->w; x += 16) {
-            const uint8_t *px = base + (size_t)y * bpr + (size_t)x * 4;
-            sum += px[0] + px[1] + px[2];
-        }
-    }
-    IOSurfaceUnlock(b->iosurf, kIOSurfaceLockReadOnly, NULL);
-    mp_msg(log, MSGL_INFO, "[xr] IOSurface[%d] id=%u 抽样像素和=%lu %s\n",
-           idx, b->iosurface_id, sum, sum > 0 ? "(非空)" : "(全黑)");
-    pthread_mutex_unlock(&g_lock);
-    return sum > 0;
 }

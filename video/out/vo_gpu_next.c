@@ -1073,6 +1073,84 @@ static void update_tm_viz(struct pl_color_map_params *params,
 static void update_hook_opts_dynamic(struct priv *p, const struct pl_hook *hook,
                                      const struct mp_image *mpi);
 
+#if defined(__APPLE__) && HAVE_VULKAN
+// [xr] 渲染目标的来源:窗口走原 swapchain,无窗出口走后台 IOSurface 纹理。
+// 把原本摊在 draw_frame 中间的分叉收进这里,令 draw_frame 只剩一个三态调用点
+// (见 ADR 0010:mpv 侧封装,收缩对上游核心函数 draw_frame 的侵入面,便于 rebase)。
+enum xr_target {
+    XR_TARGET_WINDOW,  // 有 swapchain:交回 draw_frame 的原窗口路径
+    XR_TARGET_READY,   // surfaceless:swframe 已指向后台 IOSurface,可直接渲染
+    XR_TARGET_DROP,    // 无渲染目标(未启用/尺寸非法/取纹理失败):丢帧
+};
+
+static enum xr_target xr_acquire_render_target(struct vo *vo, struct priv *p, pl_gpu gpu,
+                                               struct pl_swapchain_frame *swframe,
+                                               uint32_t *out_back_id)
+{
+    if (p->sw)
+        return XR_TARGET_WINDOW; // 窗口模式:走上游原 swapchain 路径
+
+    if (!xr_resident_enabled()) {
+        // headless 上下文但出口未启用 → 无任何渲染目标。丢帧,避免走进
+        // headless_swapchain 的 NULL start_frame(空指针调用)。
+        MP_VERBOSE(vo, "[xr] headless 上下文但 resident 出口未启用,丢帧\n");
+        return XR_TARGET_DROP;
+    }
+
+    extern pl_tex xr_resident_back_tex(struct mp_log *log, pl_gpu gpu, int w, int h, uint32_t *out_id);
+    extern bool xr_resident_external_size(int *w, int *h);
+    int rw = 0, rh = 0;
+    if (!xr_resident_external_size(&rw, &rh)) {
+        // 启用了出口但没配置外部 IOSurface,回落到视频尺寸、内部自建缓冲。
+        rw = vo->dwidth;
+        rh = vo->dheight;
+    }
+    if (rw <= 0 || rh <= 0) {
+        MP_ERR(vo, "[xr] surfaceless 渲染目标尺寸无效 %dx%d\n", rw, rh);
+        return XR_TARGET_DROP;
+    }
+    // [xr] 几何对齐(修「放大 N 倍只见左上角」):headless 无窗,vo->dwidth/dheight
+    // 默认停在视频原生尺寸,但渲染目标(IOSurface)是 rw×rh。若不同步,
+    // vo_get_src_dst_rects 按原生尺寸算 dst,apply_crop 会把视频画到远大于 fbo 的
+    // 矩形 → 只剩左上角。把显示尺寸对齐到 IOSurface 并就地重算 src/dst/osd_res,
+    // 使整帧等比缩放铺满 IOSurface。仅在尺寸变化时重算(首帧后命中即跳过)。
+    if (vo->dwidth != rw || vo->dheight != rh) {
+        vo->dwidth = rw;
+        vo->dheight = rh;
+        vo_get_src_dst_rects(vo, &p->src, &p->dst, &p->osd_res);
+        p->osd_sync++;
+    }
+    // 取「后台缓冲」(双缓冲环里非 front 的那张),渲染进它。
+    pl_tex rtex = xr_resident_back_tex(vo->log, gpu, rw, rh, out_back_id);
+    if (!rtex)
+        return XR_TARGET_DROP;
+    *swframe = (struct pl_swapchain_frame){
+        .fbo = rtex,
+        .flipped = false,
+        .color_repr = pl_color_repr_rgb,
+        // [xr] HDR 出口契约(ADR 0005):渲染目标 = 扩展线性 Display P3。fp16 可承载
+        // >1.0 的线性光 → 消费端以 extendedLinearDisplayP3 + .hdrColor 采样为 EDR。
+        // 传递/原色/峰值由 target-* 选项精确驱动;此处给出与之一致的基底。
+        .color_space = (struct pl_color_space){
+            .primaries = PL_COLOR_PRIM_DISPLAY_P3,
+            .transfer  = PL_COLOR_TRC_LINEAR,
+        },
+    };
+    return XR_TARGET_READY;
+}
+
+// [xr] 发布:完成屏障保证写入结束 → 把后台缓冲发布为 front(门①双缓冲,ADR 0003)。
+// 注:仍是 pl_gpu_finish 全停屏障,异步跨设备 fence + 三缓冲是后续优化(ADR 0009/0010)。
+static void xr_publish_render_target(pl_gpu gpu, bool surfaceless, uint32_t back_id)
+{
+    if (!surfaceless)
+        return;
+    extern void xr_resident_publish_front(uint32_t iosurface_id);
+    pl_gpu_finish(gpu);
+    xr_resident_publish_front(back_id);
+}
+#endif
+
 static bool draw_frame(struct vo *vo, struct vo_frame *frame)
 {
     struct priv *p = vo->priv;
@@ -1293,41 +1371,15 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
 
     struct pl_swapchain_frame swframe;
 #if defined(__APPLE__) && HAVE_VULKAN
-    // [xr] 无窗 surfaceless 出口(macvk_resident):没有 swapchain,渲染目标直接是
-    // 外部导入的 IOSurface 纹理。让它冒充一帧 swapchain frame,下游渲染管线与窗口
-    // 路径完全一致(见 ADR 0003 落地步骤 B)。
-    bool xr_surfaceless = !p->sw && xr_resident_enabled();
+    // [xr] 渲染目标分叉收进 xr_acquire_render_target(定义见 draw_frame 上方):
+    // 窗口模式交回下方原 swapchain 路径;surfaceless 出口把 swframe 指向后台 IOSurface。
+    bool xr_surfaceless = false;
     uint32_t xr_back_id = 0; // 本帧写入的后台缓冲 IOSurfaceID,渲染后据此发布 front
-    if (!p->sw && !xr_surfaceless) {
-        // [xr] 防御:headless 上下文但出口未启用 → 无任何渲染目标。丢帧,
-        // 避免走进下方 headless_swapchain 的 NULL start_frame(空指针调用)。
-        MP_VERBOSE(vo, "[xr] headless 上下文但 resident 出口未启用,丢帧\n");
+    enum xr_target xr_t = xr_acquire_render_target(vo, p, gpu, &swframe, &xr_back_id);
+    if (xr_t == XR_TARGET_DROP)
         return VO_FALSE;
-    }
-    if (xr_surfaceless) {
-        extern pl_tex xr_resident_back_tex(struct mp_log *log, pl_gpu gpu, int w, int h, uint32_t *out_id);
-        extern bool xr_resident_external_size(int *w, int *h);
-        int rw = 0, rh = 0;
-        if (!xr_resident_external_size(&rw, &rh)) {
-            // 防御:启用了出口但没配置外部 IOSurface,回落到视频尺寸、内部自建缓冲。
-            rw = vo->dwidth;
-            rh = vo->dheight;
-        }
-        if (rw <= 0 || rh <= 0) {
-            MP_ERR(vo, "[xr] surfaceless 渲染目标尺寸无效 %dx%d\n", rw, rh);
-            return VO_FALSE;
-        }
-        // 取「后台缓冲」(双缓冲环里非 front 的那张),渲染进它。
-        pl_tex rtex = xr_resident_back_tex(vo->log, gpu, rw, rh, &xr_back_id);
-        if (!rtex)
-            return VO_FALSE;
-        swframe = (struct pl_swapchain_frame){
-            .fbo = rtex,
-            .flipped = false,
-            .color_repr = pl_color_repr_rgb,
-            .color_space = pl_color_space_srgb,
-        };
-    } else
+    xr_surfaceless = (xr_t == XR_TARGET_READY);
+    if (!xr_surfaceless)
 #endif
     {
     bool should_draw = sw->fns->start_frame(sw, NULL); // for wayland logic
@@ -1543,19 +1595,7 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
     valid = true;
 
 #if defined(__APPLE__) && HAVE_VULKAN
-    // [xr] 常驻纹理出口(surfaceless / macvk_resident):主渲染已直接写入后台 IOSurface。
-    // 完成屏障保证写入结束 → 发布为 front;mpv 下一帧改写另一张,消费方只读 front,
-    // 故无撕裂(门①双缓冲,ADR 0003 步骤 D)。注:此处仍是 pl_gpu_finish 全停屏障,
-    // 异步跨设备 fence 是后续优化。
-    if (xr_surfaceless) {
-        extern void xr_resident_publish_front(uint32_t iosurface_id);
-        extern bool xr_resident_check_nonzero(struct mp_log *log, pl_gpu gpu);
-        pl_gpu_finish(gpu);
-        xr_resident_publish_front(xr_back_id);
-        static int xr_count_sl = 0;
-        if ((xr_count_sl++ % 60) == 0)
-            xr_resident_check_nonzero(vo->log, gpu);
-    }
+    xr_publish_render_target(gpu, xr_surfaceless, xr_back_id);
 #endif
 
     // fall through
@@ -2326,8 +2366,9 @@ static int preinit(struct vo *vo)
     p->sw = p->context->swapchain;
 
 #if defined(__APPLE__) && HAVE_VULKAN
-    // [xr] stage 1.0 probe: only run when the resident path is explicitly enabled.
-    if (xr_resident_enabled() && p->gpu) {
+    // [xr] stage 1.0 probe:headless(无 swapchain)上下文即打印 GPU 导出/导入能力。
+    // (原条件用 xr_resident_enabled(),但 preinit 时开关常未开,几乎不触发。)
+    if (!p->sw && p->gpu) {
         MP_INFO(vo, "[xr-probe] export.tex=0x%x import.tex=0x%x | "
                     "export(MTL=%d IOSurf=%d) import(MTL=%d IOSurf=%d)\n",
                 (unsigned)p->gpu->export_caps.tex, (unsigned)p->gpu->import_caps.tex,

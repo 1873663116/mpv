@@ -1,0 +1,10 @@
+# 验证 app 的构建产物 —— 永不入库(可随时 rm 重生成)
+verify-visionos/build/
+verify-visionos/.build/
+verify/.build/
+verify/build/
+verify/build-libmpv/
+verify/dist/
+**/xcuserdata/
+**/DerivedData/
+**/*.xcuserstate

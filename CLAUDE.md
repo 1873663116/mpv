@@ -59,20 +59,21 @@ mpv 侧(改动尽量新增、集中):
   `include/mpv/xr_resident.h` 的 4 个函数 + 标准 libmpv client API。
 - `xr-fork/verify/` 是**验证专用的参考消费者**(macOS RealityKit app),不是依赖。它不在
   libmpv 构建图里,打包 libmpv 时**天然无视、无需特殊排除**;接入新 app 照那套 API 即可。
-- ⚠️ **visionOS 的「窗口模式」尚未解决**:现窗口模式走 mpv 原生 `macvk`,绑死 AppKit
-  (`mac_common.swift`),visionOS 无 AppKit → 跑不了。visionOS 上**两种模式都应走 IOSurface 出口**
-  (mpv 当生产者),由 Enchron 决定把纹理贴球面还是贴 2D 窗口;别让 mpv 自己开窗。
+- ✅ **visionOS 输出架构已定(ADR 0009)**:窗口与沉浸**统一走 IOSurface→RealityKit**——mpv 当
+  生产者,由 Enchron 决定贴球面还是贴 2D quad;别让 mpv 自己开窗(原生 `macvk` 绑死 AppKit,
+  visionOS 跑不了)。评估过的「窗口直写 CAMetalLayer」(Option B)已搁置,种子见 `context_moltenvk.m`。
+- **接入入口:[`xr-fork/INTEGRATION.md`](xr-fork/INTEGRATION.md)** —— 怎么接 + 4 函数 API + 边界,下一个 Agent 从这读起。
 
 ## 剩余
 
-- 异步跨设备 fence(替掉当前 `pl_gpu_finish` 全停);`check_nonzero` 抽样是验证夹具,生产接入时去掉。
+- 异步跨设备 fence(替掉当前 `pl_gpu_finish` 全停)。`check_nonzero` 自验夹具已移除(2026-06-16)。
 - 阶段 2 打包:用 **MPVKit**(github.com/mpvkit/MPVKit,基线恰为 mpv v0.41.0 + libplacebo 7.360.1
   + MoltenVK 1.4.1,与本仓库一致)fork 后改 `main.swift` 两行指向本 fork 的 enchron 分支;
   ⚠️ 它的 `0001-player-add-moltenvk-context.patch` 与我们改了同两个文件,须把补丁合进 enchron
   分支再删脚本侧 patch;`make build platform=xros` 出 xcframework。visionOS 上两种模式都走
   IOSurface 出口(无 AppKit)。
-- 真机 HDR 裁决实验(ADR 0004 开放问题):rgba16Float + Unlit + 关 tone map 能否在 Vision Pro
-  上超过 SDR 白;不需要 mpv,纯 RealityKit 小实验。
+- ✅ 真机 HDR 已裁决(原 ADR 0004 开放问题):rgba16Float + Unlit + 关 tone map 在 Vision Pro 上
+  确能超 SDR 白,真机签收(ADR 0007/0008);色彩 device-tuned 默认已固化。
 - 数值验收(可选加强):IOSurface 字节 vs `screenshot-to-file` sRGB PNG 逐块比对。
 
 ---

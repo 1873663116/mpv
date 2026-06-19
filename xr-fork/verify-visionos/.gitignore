@@ -1,0 +1,10 @@
+# 大体积消费产物——不入 git,由 script/setup.sh 从姊妹仓/构建拷入
+Frameworks/*.xcframework
+Resources/*.reality
+Resources/sample.*
+
+# xcodegen 生成物 + Xcode 派生
+*.xcodeproj
+.build/
+DerivedData/
+build/
