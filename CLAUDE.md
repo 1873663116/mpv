@@ -89,6 +89,48 @@ mpv 侧(改动尽量新增、集中):
 
 ---
 
+## 色彩预设与官方默认值(2026-06-20 真机调参签收)
+
+> 沉浸出口色彩契约的三套真机预设 + mpv 0.41/libplacebo 7.360 官方默认值速查。原理与边界见
+> `xr-fork/HDR-PIPELINE.md`、ADR 0004/0006/0008。能调到的极限止于此:管线是开环,读不到系统
+> 实时 headroom(visionOS 无 API),残差(尤其极亮处)不可消除,非缺陷。
+
+**焊死项(改它=放弃 mpv 出口)**:`target-prim=display-p3`、`target-trc=linear`、材质 Unlit +
+`applyPostProcessToneMap=false`、`hdr-compute-peak=yes`。
+
+**预设「激进」**(讨喜,大部分场景贴 AV;已知残差:极亮处颜色被裁) — 仅这几项偏离默认:
+`tone-mapping=bt.2446a` · `saturation=20` · `gamma=10` · `hdr-peak-percentile=99.6` ·
+`hdr-compute-peak=yes`;其余全用下表默认。
+原理:bt.2446a 是 HDR→**SDR** 曲线(端点硬编码 1000→100nit)、天然偏暗,靠低 percentile + gamma
+把亮度回推上来,换得更强的对比/饱和"调色感"。是主观 look,不是比色参考。
+
+**预设「安全」**(不硬裁,越界色全局降饱和换不崩) — 仅这几项偏离默认:
+`tone-mapping=bt.2390` · `hdr-compute-peak=yes` · `gamut-mapping-mode=perceptual`;其余全用下表默认。
+注:`target-peak` 对本路径无效(406→1000 无变化=撞合成器 ~2.0 headroom 天花板),不必调。
+
+**预设「保守」**（除了必须更改的部分（406 203），其它完全用官方默认值，能自动的都开自动）
+
+**官方默认值速查(已核实)**:
+
+| 选项 | 默认 | 备注 |
+|---|---|---|
+| tone-mapping | `auto`(=spline) | |
+| tone-mapping-param | `default` | bt.2390 的 knee offset libplacebo 默认 1.0(spec 是 0.5);别乱设数值 |
+| tone-mapping-max-boost | 1.0 | 1.0=不额外提亮 |
+| inverse-tone-mapping | no | |
+| target-peak | `auto` | HDR 曲线=203×nominal peak 或显示器上报;这里我们固定 406 |
+| target-contrast | `auto` | HDR 目标≈无穷;我们用 `inf`=OLED 真黑 |
+| hdr-reference-white | 203 | SDR 参考白锚点;仅当目标 TRC 是 SDR 时才覆盖 target-peak |
+| hdr-peak-percentile | 100 | 调低=裁极亮细节(死白);见两预设 |
+| hdr-peak-decay-rate | 20 | 调高=峰值收敛慢=迟滞/跳变,别拉到 100 |
+| hdr-scene-threshold-low / high | 1.0 / 3.0 | |
+| **hdr-contrast-recovery** | **0.0(关)** | 可选增强,非核心 |
+| **hdr-contrast-smoothness** | **3.5** |  |
+| gamut-mapping-mode | `perceptual`(auto) | |
+| saturation / contrast / brightness / gamma / hue | 0 | 0=中性(不是 1) |
+
+---
+
 ## 本地构建与验证(macOS,已验证可复现)
 
 依赖(brew):`meson ninja libplacebo molten-vk libass`(`ffmpeg pkg-config cmake` 通常已有)。

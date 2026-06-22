@@ -2,3 +2,6 @@
 !/subprojects/packagefiles
 !/subprojects/*.wrap
 .DS_Store
+
+# xr-fork 本地编译的探针产物
+xr-fork/probe/xr_tput

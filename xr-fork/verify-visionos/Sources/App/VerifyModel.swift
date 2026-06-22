@@ -3,6 +3,7 @@ import Foundation
 import Libmpv
 import RealityKit
 import SwiftUI
+import UIKit
 import os
 
 /// 编排:加载 RCP 场景(`Entity(named:"world")`,来自 bundle 的 Immersive_Space.reality),
@@ -18,15 +19,57 @@ final class VerifyModel {
     var isPaused = false
 
     private let logger = Logger(subsystem: "enchron.verify.visionos", category: "verify")
-    private let width = 1280
-    private let height = 720
-    /// 纹理/IOSurface 比例(16:9)。消费端按此把面片等比定形为 16:9(铺满、无黑边、不失真)。
-    private var displayAspect: Float { Float(width) / Float(height) }
+    /// 渲染分辨率:换片时按视频原生尺寸探测后填(reloadAtNativeResolution);testsrc/未选片时为默认。
+    private var width = 1280
+    private var height = 720
+    /// [xr-perf 杠杆A·调试开关] 渲染分辨率长边上限。0 = 不限(原生,默认)。>0 = 等比压到此长边内。
+    /// 这是"硬吃"的应急杠杆,不是正解;正解是杠杆2(按内容路由像素格式,不损画质)。默认关,
+    /// 仅在调参面板手动开启用于对照。设 1920 即等距 360 → 1920×960。
+    private var xrMaxLongEdge = 0
+    /// [xr-perf 杠杆2] 像素格式路由:模式(自动/强制)+ 当前解析出的格式。建 IOSurface 前解析,
+    /// 换片/换模式时随分辨率一并重定。见 [[XRColorRoute]] / ResidentVideoSurface。
+    private var routeMode: XRRouteMode = .auto
+    private var currentRoute: XRColorRoute = .hdr16
+    /// mpv 屏实体(运行时重建材质 / 重载用)。
+    private var mpvScreenEntity: Entity?
+    /// 消费端状态(非 mpv 属性):RealityKit tone map 归属 + EDR 曝光乘子。
+    private var realityKitToneMap = false
+    private var edrExposure = 1.0
+    /// EDR 曝光>1 时 target-peak 提亮的基准(= 策略一默认峰值)。
+    private let exposurePeakBase = 406.0
+    /// 连续漂移校正阈值(秒):|av−mpv| 超过即把 AV 重对齐到 mpv 主钟。≈3–4 帧@30fps,避免反复 seek 抖动。
+    private let driftTolerance = 0.12
+    /// 纹理/IOSurface 比例。消费端按此把面片等比定形(铺满、无黑边、不失真)。窗口模式平面也用它。
+    var displayAspect: Float { Float(width) / Float(height) }
     /// 纹理转正的面内自转量(1/4 圈为单位)。面片网格 UV 随建模平面朝向被转了 90°,
     /// 需绕法线反转回来。-1 = 顺时针 90°;若视频呈上下颠倒/仍旋转,改这里的符号或圈数即可。
     private let textureQuarterTurns: Float = -1
     /// 各面片的原始 RCP transform(orientPanel 的幂等基准:每次都从原始推导,避免反复叠加)。
     private var originalPanelTransforms: [String: Transform] = [:]
+
+    /// 顶层显示模式(三选一,各是独立 scene):
+    /// - `window`:WindowGroup 平面播放窗(选片即播,不进沉浸)。
+    /// - `immersive`:RCP 场景 + 虚拟屏(私人影院)。
+    /// - `panorama`:裸朝内球(360/180),独立于 RCP 场景。
+    enum DisplayMode: String, CaseIterable { case window, immersive, panorama }
+    private(set) var mode: DisplayMode = .immersive
+
+    /// 全景模式下的子投影(只在 panorama 内有意义)。
+    enum PanoramaProjection: String, CaseIterable { case sphere360, hemisphere180 }
+    private(set) var panoramaProjection: PanoramaProjection = .sphere360
+
+    /// 立体拆眼(路 A 单眼正确):mono=整幅;SBS/TB 取主眼半幅烘进 UV。真景深(左右眼分离)
+    /// 留给后续 RCP Camera Index Switch(同一套 `StereoLayout` 数学)。
+    private(set) var stereoPacking: StereoLayout.Packing = .mono
+    private(set) var stereoSwap = false
+
+    /// 全景球实体(panorama 模式;运行时建/拆)。`mpvScreenEntity`(上方)= RCP 虚拟屏。
+    private var panoramaEntity: Entity?
+    /// 窗口模式平面实体。
+    private var windowPlaneEntity: Entity?
+    /// AV 对照屏开关:默认**关**。开则并行解第二路(色彩比对用),8K 素材会显著加载;
+    /// 真机看全景只需 mpv 单路,需比色时再开。遥控器/控制窗都可切。
+    private(set) var avEnabled = false
 
     private var surface: ResidentVideoSurface?
     private let mpv = MpvPlayer()
@@ -66,6 +109,19 @@ final class VerifyModel {
         tuning.toggleCb = { [weak self] in self?.togglePause() }
         tuning.sampleCb = { [weak self] in self?.sampleMetrics() ?? nil }
         tuning.timeCb = { [weak self] in self?.mpv.timePosDur() ?? nil }
+        tuning.syncCb = { [weak self] in self?.correctDriftIfNeeded() }
+        tuning.reloadCb = { [weak self] in self?.reloadAtNativeResolution() }
+        tuning.rollOffCb = { [weak self] on in self?.setRealityKitToneMap(on: on) }
+        tuning.exposureCb = { [weak self] m in self?.setEdrExposure(m) }
+        tuning.routeModeCb = { [weak self] m in self?.setRouteMode(m) }
+        tuning.resolutionCapCb = { [weak self] on in self?.setResolutionCap(on ? 1920 : 0) }
+        tuning.freezeSwapCb = { [weak self] on in self?.setFreezeSwap(on) }
+        tuning.isPaused = isPaused
+        tuning.rollOffRealityKit = realityKitToneMap
+        tuning.edrExposure = edrExposure
+        tuning.routeMode = routeMode
+        tuning.resolutionCapOn = xrMaxLongEdge > 0
+        tuning.freezeSwap = VideoFrameSystem.freezeSwap
         tuning.attach()
         report("[xr-tune] 调参面板已接线 —— 控制窗『调参面板』进入")
     }
@@ -75,6 +131,9 @@ final class VerifyModel {
 
     /// 读 front IOSurface 的 fp16 仪表(>1.0高光% / 黑位p1 / 饱和p90 / >2.0过曝%),显示无关。
     private func sampleMetrics() -> (gt1: Double, p1: Double, sat: Double, gt2: Double)? {
+        // sampleLuminanceStats/sampleChroma 硬当 fp16(8 字节/像素)读;sdr8 路是 4 字节/像素,
+        // 按 8 字节步进会越界/读垃圾。故仅 fp16 路采样(仪表本就是 HDR 色彩验证用)。
+        guard currentRoute == .hdr16 else { return nil }
         let f = xr_resident_front_iosurface_id()
         guard let surface, f != 0 else { return nil }
         let L = surface.sampleLuminanceStats(forID: f)
@@ -128,72 +187,349 @@ final class VerifyModel {
         // 转储整棵实体树名字:.reality 是 AES 加密 zip,离线挖不出实体名;
         // 真实名(尤其 AV 对照面片)从这里的 [xr-scene] 行确认(经 Xcode MCP 读控制台)。
         dumpEntityNames(world)
-        report("阶段0:场景已加载(未接纹理面/mpv)。逐级点开关定位崩溃。")
+        // 沉浸模式:绑 RCP 虚拟屏 + 起播(幂等)。
+        mode = .immersive
+        enterImmersiveScreen()
+        report("沉浸场景已加载,起播中…")
     }
 
-    /// 阶段 1:建零拷贝 IOSurface 纹理环 + 把 mpv 屏材质换成 UnlitMaterial。
-    /// 单独测 Metal / IOSurface / `TextureResource.__texture` + 材质替换这一层,尚不启动 mpv。
-    func enableTexturePlane() {
-        guard let world else { report("请先进入沉浸场景"); return }
-        guard surface == nil else { report("纹理面已接入"); return }
-        do {
-            let surface = try ResidentVideoSurface(width: width, height: height)
-            self.surface = surface
-            guard let screen = world.findEntity(named: "screen") else {
-                report("场景里找不到 'screen' 实体")
-                return
+    /// 性能 HUD 文本(遥控器显示):渲染帧率 / 视频出帧率 / 内存。
+    var perf = "perf —"
+    private var perfStarted = false
+
+    /// 每 5 秒采样一次帧率计数器(原 1s 刷屏),算出渲染 fps 与视频出帧 fps,落 HUD + 日志。
+    /// ⚠️ 这是粗略量,非地面真值:`renderTicks` 数的是 System.update 调用次数,且在 MainActor 拥塞时
+    /// `Task.sleep` 会漂移——故改用**真实经过时间**换算(修掉旧版把每秒次数算成 2~3 倍、冒出 >90 假值的 bug)。
+    /// 绝对帧率/瓶颈归属以 Instruments『RealityKit Trace』的 GPU/CPU Frame Time 为准,此处仅作现场速览。
+    /// 诊断:videoFPS 远低于源帧率 = 卡在 mpv 解码/出帧;renderFPS 也低 = 卡在 RealityKit 渲染端。
+    private func startPerfMonitor() {
+        guard !perfStarted else { return }
+        perfStarted = true
+        var lastTicks = VideoFrameSystem.renderTicks
+        var lastFrames = VideoFrameSystem.framesPublished
+        var lastDrop = 0, lastDecDrop = 0
+        var lastNanos = DispatchTime.now().uptimeNanoseconds
+        Task { @MainActor [weak self] in
+            while let self, self.mpvStarted {
+                try? await Task.sleep(nanoseconds: 5_000_000_000)   // 5s:降打印频率
+                let nowNanos = DispatchTime.now().uptimeNanoseconds
+                let elapsed = Double(nowNanos &- lastNanos) / 1_000_000_000   // 真实经过秒(非假定窗口)
+                lastNanos = nowNanos
+                guard elapsed > 0.1 else { continue }
+                let t = VideoFrameSystem.renderTicks, f = VideoFrameSystem.framesPublished
+                let rFps = Double(t - lastTicks) / elapsed
+                let vFps = Double(f - lastFrames) / elapsed
+                lastTicks = t; lastFrames = f
+                let mem = Int(self.currentMemoryFootprintMB())
+                // [xr-perf 诊断·第二问题] mpv 自带计数器,把"跳帧"钉到具体环节:
+                // drop=VO 因晚到丢的帧(framedrop=vo 默认);decDrop=解码跟不上丢的;
+                // vfFps=mpv 滤镜后实际产出帧率(≈源帧率说明 mpv 产得出,卡在下游;<源说明卡在 mpv)。
+                let drop = Int(self.mpv.getProperty("frame-drop-count") ?? "") ?? lastDrop
+                let decDrop = Int(self.mpv.getProperty("decoder-frame-drop-count") ?? "") ?? lastDecDrop
+                let dDrop = drop - lastDrop, dDec = decDrop - lastDecDrop
+                lastDrop = drop; lastDecDrop = decDrop
+                let vfFps = self.mpv.getProperty("estimated-vf-fps") ?? "?"
+                // [xr-perf 杠杆2·带宽估算] 真·硬件带宽计数器 visionOS 不开放,这里给可解释的估算:
+                // 写 = 每帧整张纹理 × 发布帧率;读 = 每帧整张 × 渲染帧率(上界,忽略缓存命中)。
+                let texMB = Double(self.currentRoute.bytesPerPixel * self.width * self.height) / 1_048_576.0
+                let bwGBs = texMB * (vFps + rFps) / 1024.0
+                let rI = Int(rFps.rounded()), vI = Int(vFps.rounded())
+                let frozen = VideoFrameSystem.freezeSwap ? " · ❄️冻结" : ""
+                self.perf = "渲染 \(rI) · 视频 \(vI)fps · \(self.currentRoute.label) · ~\(String(format: "%.1f", bwGBs))GB/s · \(mem)MB · \(self.width)×\(self.height)\(frozen)"
+                self.logger.info("[xr-perf] renderFPS=\(rI, privacy: .public) videoFPS=\(vI, privacy: .public) frozen=\(VideoFrameSystem.freezeSwap, privacy: .public) vfFps=\(vfFps, privacy: .public) drop=\(dDrop, privacy: .public) decDrop=\(dDec, privacy: .public) route=\(self.currentRoute.rawValue, privacy: .public) texMB=\(String(format: "%.1f", texMB), privacy: .public) bw~\(String(format: "%.1f", bwGBs), privacy: .public)GB/s mem=\(mem, privacy: .public)MB res=\(self.width, privacy: .public)x\(self.height, privacy: .public) mode=\(self.mode.rawValue, privacy: .public)")
             }
-            bindResident(surface: surface, to: screen)
-            orientPanel(screen, textureAspect: displayAspect)
-            report("阶段1:纹理面已接入(IOSurface 环 + UnlitMaterial + 摆正),未启动 mpv。崩则在 Metal/纹理层。")
-        } catch {
-            report("阶段1 建纹理面失败: \(error.localizedDescription)")
         }
     }
 
-    /// 阶段 2:启动 mpv(MoltenVK/Vulkan 设备 + 渲染进 IOSurface,逐帧换 front)。
-    /// 崩在这里 = mpv/MoltenVK 与 RealityKit Metal 共存的问题。
-    func enableMpv() {
-        guard let surface else { report("请先接入纹理面(阶段1)"); return }
-        guard !mpvStarted else { report("mpv 已启动"); return }
+    /// [xr] LLDR 零拷贝换帧驱动:把换帧并入 RealityKit 每帧节拍(VideoFrameSystem.update,@MainActor),
+    /// 取代旧的自走 ~120Hz `Task.sleep` 轮询(Instruments 真机实测:自走循环与显示/视频两个时钟都不同步
+    /// → 拍频抖动 + 主线程 `CFRunLoop` 空转,而 GPU/CPU 本身仅 ~4/3ms,远低于 11.1ms 预算)。
+    /// 安装一个读"当前 surface"的回调,System 每帧调它(冻结开关在 update 内生效);surface 重建后
+    /// 回调自动读到新值,无需重设。`xr_resident_front_iosurface_id` 变了才真切(presentFront 内部判)。
+    private func startPresenter() {
+        VideoFrameSystem.onFrameTick = { [weak self] in
+            guard let self, let surface = self.surface else { return }
+            let f = xr_resident_front_iosurface_id()
+            if f != 0, surface.presentFront(f) { VideoFrameSystem.framesPublished &+= 1 }
+        }
+    }
+
+    /// AV 对照开关(遥控器/控制窗):开则接同源第二路解码做色彩比对,关则停掉省负载。
+    func setAVComparison(_ on: Bool) {
+        avEnabled = on
+        if on {
+            if let url = currentSourceURL {
+                attachAV(url: url)
+                report("AV 对照已开 → \(url.lastPathComponent)")
+            } else {
+                report("AV 对照:当前无真实片源(testsrc 无对照,跳过)")
+            }
+        } else {
+            av.stop()
+            report("AV 对照已关(单路解码)")
+        }
+    }
+
+    // ── 生命周期(模式无关):IOSurface 环 + mpv,各模式共用一份 ──
+
+    /// 建 IOSurface 纹理环(若未建)。是 mpv 渲染目标,必须在 mpv 起前按尺寸备好。
+    @discardableResult
+    private func ensureSurface() -> ResidentVideoSurface? {
+        if surface == nil {
+            do { surface = try ResidentVideoSurface(width: width, height: height, route: currentRoute) }
+            catch { report("建 IOSurface 失败: \(error.localizedDescription)"); return nil }
+        }
+        return surface
+    }
+
+    /// 启动 mpv(若未启动):渲染进 IOSurface 环,逐帧换 front。幂等。
+    private func startMpvIfNeeded() {
+        guard let surface, !mpvStarted else { return }
         do {
             let (mpvSource, avURL) = resolveSources()
             try mpv.start(source: mpvSource, surfaceIDs: surface.iosurfaceIDs,
-                          width: width, height: height)
+                          width: surface.width, height: surface.height, route: surface.route)
             mpvStarted = true
-            report("阶段2:mpv 已启动 | IOSurfaceIDs=\(surface.iosurfaceIDs) | src=\(mpvSource)")
-
-            // 对照组:AVFoundation → AV 面片(仅在已选真实片源时;testsrc 无对应 URL,按设计跳过)。
-            if let avURL {
-                attachAV(url: avURL)
-            }
-            // 接线运行时调参面板(读回当前值 + 启动实时仪表/进度轮询)。
+            if avEnabled, let avURL { attachAV(url: avURL) }
             wireTuning()
+            startPerfMonitor()
+            startPresenter()
+            Task { @MainActor in await loadStereoMaterialIfNeeded() }   // 预载立体材质,切 SBS/TB 即用
+            report("mpv 已启动 \(surface.width)x\(surface.height) | src=\(mpvSource)")
         } catch {
-            report("阶段2 启动 mpv 失败: \(error.localizedDescription)")
+            report("启动 mpv 失败: \(error.localizedDescription)")
         }
     }
 
-    private func bindResident(surface: ResidentVideoSurface, to screen: Entity) {
-        let materials = Dictionary(uniqueKeysWithValues:
-            surface.buffers.map { ($0.id, Self.makeMaterial($0.textureResource)) })
+    /// 通用绑定:把 IOSurface 环的逐帧材质挂到任意实体(平面/球面共用)。
+    private func bindResident(to entity: Entity, faceCount: Int) {
+        guard let surface else { return }
+        let material = currentMaterial(surface)
+        if var model = entity.components[ModelComponent.self] {
+            model.materials = Array(repeating: material, count: max(1, faceCount))
+            entity.components.set(model)
+        }
+        entity.components.set(ResidentVideoComponent())
+    }
+
+    // ── 三个模式各自的接入入口(由对应 scene 的 RealityView 调用)──
+
+    /// 沉浸模式:绑 RCP 虚拟屏 `screen` + 摆正 + 起播。
+    func enterImmersiveScreen() {
+        guard let world, let screen = world.findEntity(named: "screen") else {
+            report("沉浸:找不到 RCP 'screen' 实体"); return
+        }
+        guard ensureSurface() != nil else { return }
+        mpvScreenEntity = screen
         let faceCount = screen.components[ModelComponent.self]?.materials.count ?? 1
-
-        // 先挂第 0 张,免得首帧前平面是空白。
-        if var model = screen.components[ModelComponent.self],
-           let initial = materials[surface.buffers[0].id] {
-            model.materials = Array(repeating: initial, count: max(1, faceCount))
-            screen.components.set(model)
-        }
-        screen.components.set(ResidentVideoComponent(materialsByID: materials, faceCount: faceCount))
+        bindResident(to: screen, faceCount: faceCount)
+        orientPanel(screen, textureAspect: displayAspect)
+        startMpvIfNeeded()
     }
 
-    /// 关闭 RealityKit 默认 tone mapping:视频帧已是显示就绪的 sRGB 颜色(ADR 0004)。
-    private static func makeMaterial(_ resource: TextureResource) -> UnlitMaterial {
-        var material = UnlitMaterial(applyPostProcessToneMap: false)
-        material.color = .init(tint: .white, texture: .init(resource))
+    /// 全景模式:建/复用朝内球(360/180)+ 绑定 + 起播,返回球实体供 scene 添加。
+    func enterPanorama() -> Entity? {
+        guard ensureSurface() != nil else { return nil }
+        let entity = panoramaEntity ?? Entity()
+        entity.name = "xr-panorama"
+        panoramaEntity = entity
+        applyPanoramaMesh(to: entity)
+        startMpvIfNeeded()
+        return entity
+    }
+
+    /// 窗口模式:绑窗口里的平面实体(立体可烘 UV)+ 起播。
+    func enterWindowPlane(_ entity: Entity) {
+        guard ensureSurface() != nil else { return }
+        windowPlaneEntity = entity
+        applyWindowQuad(to: entity)
+        startMpvIfNeeded()
+    }
+
+    /// 装全景球:**满幅 equirect mesh**(分眼交给立体材质的 Camera Index Switch,mono 则整幅)+ 材质。
+    private func applyPanoramaMesh(to entity: Entity) {
+        guard let surface else { return }
+        let spec: PanoramaMesh.Spec = (panoramaProjection == .sphere360) ? .sphere360 : .hemisphere180
+        do {
+            let mesh = try PanoramaMesh.makeResource(spec)
+            let material = currentMaterial(surface)
+            entity.components.set(ModelComponent(mesh: mesh, materials: [material]))
+            entity.components.set(ResidentVideoComponent())
+            report("全景 = \(panoramaProjection.rawValue) · 立体 = \(stereoLabel)(朝内球 r=\(spec.radius)m)")
+        } catch {
+            report("建全景球失败: \(error.localizedDescription)")
+        }
+    }
+
+    /// 装窗口/平面 quad:**满幅 UV** + 材质(分眼同上交给材质)。
+    private func applyWindowQuad(to entity: Entity) {
+        guard let surface else { return }
+        do {
+            let mesh = try PanoramaMesh.quad(aspect: displayAspect)
+            let material = currentMaterial(surface)
+            entity.components.set(ModelComponent(mesh: mesh, materials: [material]))
+            entity.components.set(ResidentVideoComponent())
+            report("窗口平面 · 立体 = \(stereoLabel)")
+        } catch {
+            report("建窗口平面失败: \(error.localizedDescription)")
+        }
+    }
+
+    /// 切全景子投影(360↔180,热切无需重载)。
+    func setPanoramaProjection(_ p: PanoramaProjection) {
+        panoramaProjection = p
+        guard let entity = panoramaEntity else { return }
+        applyPanoramaMesh(to: entity)
+    }
+
+    /// 切立体拆眼(mono/SBS/TB + swap,热切)。SBS/TB 走 ShaderGraph 真分眼,先确保材质就绪再重绑。
+    func setStereo(packing: StereoLayout.Packing, swap: Bool) {
+        stereoPacking = packing
+        stereoSwap = swap
+        Task { @MainActor in
+            if packing != .mono { await loadStereoMaterialIfNeeded() }
+            switch mode {
+            case .panorama: if let e = panoramaEntity { applyPanoramaMesh(to: e) }
+            case .window:   if let e = windowPlaneEntity { applyWindowQuad(to: e) }
+            case .immersive: report("沉浸虚拟屏暂不拆眼 — 看 3D 用窗口/全景模式")
+            }
+        }
+    }
+
+    private var stereoLabel: String {
+        let p: String
+        switch stereoPacking { case .mono: p = "mono"; case .sbs: p = "SBS"; case .tb: p = "TB" }
+        return stereoPacking == .mono ? p : (stereoSwap ? "\(p)·swap" : p)
+    }
+
+    /// 模式标记(由控制窗在打开对应 scene 前/后设置,用于状态与 perf 日志)。
+    func setMode(_ m: DisplayMode) { mode = m }
+
+    /// [xr-perf 杠杆A] 把源宽高按 xrMaxLongEdge 等比压到上限内,长宽取偶数(采样/对齐友好)。
+    /// 0 或已在上限内则原样返回。三个赋值点(prepareBench / reload / selectVideo)统一过这道。
+    private func cappedRenderSize(_ w: Int, _ h: Int) -> (Int, Int) {
+        guard xrMaxLongEdge > 0, max(w, h) > xrMaxLongEdge else { return (w, h) }
+        let scale = Double(xrMaxLongEdge) / Double(max(w, h))
+        let cw = max(2, Int((Double(w) * scale).rounded()) / 2 * 2)
+        let ch = max(2, Int((Double(h) * scale).rounded()) / 2 * 2)
+        return (cw, ch)
+    }
+
+    /// [xr-perf 杠杆2] 解析像素格式路由。强制模式直接定;auto 读源元数据(AVFoundation)判 HDR。
+    /// 无 URL(testsrc 等)按 HDR 保守(保持现有 fp16 默认路径)。必须在建 IOSurface 前调用。
+    private func resolveRoute(url: URL?) async {
+        switch routeMode {
+        case .forceSDR: currentRoute = .sdr8
+        case .forceHDR: currentRoute = .hdr16
+        case .auto:
+            if let url { currentRoute = await av.probeIsHDR(url: url) ? .hdr16 : .sdr8 }
+            else { currentRoute = .hdr16 }
+        }
+        logger.info("[xr-perf] route=\(self.currentRoute.rawValue, privacy: .public) mode=\(self.routeMode.rawValue, privacy: .public)")
+    }
+
+    /// [xr-bench] 投影开销对照:设源 + 探原生分辨率(供 App 层开全景空间后驱动 360↔180 对照)。
+    func prepareBench(path: String) async {
+        benchSource = path
+        let url = URL(fileURLWithPath: path)
+        if let sz = await av.naturalSize(url: url), sz.width > 0, sz.height > 0 {
+            (width, height) = cappedRenderSize(Int(sz.width), Int(sz.height))
+            benchLog("源 \(Int(sz.width))×\(Int(sz.height)) → 渲染 \(width)×\(height)(长边上限 \(xrMaxLongEdge))")
+        }
+        await resolveRoute(url: url)
+        benchLog("准备完成 src=\(path) res=\(width)x\(height) route=\(currentRoute.rawValue)")
+    }
+    func benchLog(_ s: String) { logger.info("[xr-bench] \(s, privacy: .public)") }
+
+    /// 换片重载后按当前模式重绑(surface 重建 → 材质引用全变,必须重绑)。
+    private func rebindCurrentMode() {
+        switch mode {
+        case .immersive:
+            if let screen = mpvScreenEntity {
+                bindResident(to: screen, faceCount: screen.components[ModelComponent.self]?.materials.count ?? 1)
+                orientPanel(screen, textureAspect: displayAspect)
+            }
+        case .panorama:
+            if let e = panoramaEntity { applyPanoramaMesh(to: e) }
+        case .window:
+            if let e = windowPlaneEntity { applyWindowQuad(to: e) }
+        }
+    }
+
+    /// 构造 mpv 屏材质。两个消费端旋钮在此生效:
+    /// - `realityKitToneMap`:applyPostProcessToneMap。false=mpv 自己做软肩(直通);true=RealityKit 折 >1.0(与 mpv 互斥)。
+    /// - `edrExposure`:<1 时用 tint 灰度做消费端即时衰减(>1 的提亮走 mpv target-peak,见 setEdrExposure)。
+    private func makeMaterial(_ resource: TextureResource) -> UnlitMaterial {
+        var material = UnlitMaterial(applyPostProcessToneMap: realityKitToneMap)
+        let tintLevel = CGFloat(min(max(edrExposure, 0), 1))   // tint 只能衰减(≤1),>1 提亮交给 target-peak
+        material.color = .init(tint: UIColor(white: tintLevel, alpha: 1), texture: .init(resource))
         return material
     }
+
+    /// 运行时重建 mpv 屏全部材质(切 roll-off 归属 / EDR 曝光后调)。纹理不变只换材质 —— 无需重载视频。
+    /// 立即把当前 front 对应的新材质贴上,暂停态也即时生效。
+    private func rebuildMaterials() {
+        guard let surface else { return }
+        // 立体(ShaderGraph)实体:重走 apply 保留分眼,不要被换成 Unlit。
+        if stereoPacking != .mono {
+            if let e = panoramaEntity, mode == .panorama { applyPanoramaMesh(to: e); return }
+            if let e = windowPlaneEntity, mode == .window { applyWindowQuad(to: e); return }
+        }
+        // mono / 沉浸虚拟屏:重建那张常驻 UnlitMaterial(调色 roll-off/EDR 即时生效);纹理零拷贝不变。
+        let material = currentMaterial(surface)
+        for entity in [mpvScreenEntity, panoramaEntity, windowPlaneEntity].compactMap({ $0 }) {
+            let faceCount = entity.components[ModelComponent.self]?.materials.count ?? 1
+            if var model = entity.components[ModelComponent.self] {
+                model.materials = Array(repeating: material, count: max(1, faceCount))
+                entity.components.set(model)
+            }
+        }
+    }
+
+    // ── 立体真分眼(路 B):ShaderGraph + Camera Index Switch ──
+
+    /// 手写的立体材质(StereoMaterial.usda),加载一次复用。已在模拟器证实可加载。
+    private var stereoBaseMaterial: ShaderGraphMaterial?
+
+    /// 加载立体材质(幂等,异步一次)。startMpv 后预载,切 SBS/TB 即用。
+    private func loadStereoMaterialIfNeeded() async {
+        guard stereoBaseMaterial == nil else { return }
+        do {
+            stereoBaseMaterial = try await ShaderGraphMaterial(named: "/Root/Material", from: "StereoMaterial")
+            report("[xr-stereo] 立体材质已加载")
+        } catch {
+            report("[xr-stereo] 立体材质加载失败: \(error.localizedDescription)")
+        }
+    }
+
+    /// 当前该用的**单一**材质:mono→UnlitMaterial,SBS/TB 且材质就绪→ShaderGraph 真分眼,否则回落 mono。
+    /// LLDR 零拷贝下纹理是常驻单张(surface.textureResource),不再按缓冲建字典 —— 换帧靠 LLT.replace。
+    private func currentMaterial(_ surface: ResidentVideoSurface) -> any RealityKit.Material {
+        if stereoPacking != .mono, let stereo = stereoMaterial(surface) { return stereo }
+        return makeMaterial(surface.textureResource)
+    }
+
+    /// 单一立体材质(ShaderGraph):`videoTexture` 绑常驻 textureResource + UV 拆半(左/右眼子矩形)。
+    /// 分眼由 GPU 的 Camera Index Switch 每眼自动完成;参数一次性设定,无逐帧 setParameter。
+    private func stereoMaterial(_ surface: ResidentVideoSurface) -> ShaderGraphMaterial? {
+        guard var base = stereoBaseMaterial else { return nil }
+        let l = StereoLayout.eyeRect(isLeft: true, packing: stereoPacking, swap: stereoSwap)
+        let r = StereoLayout.eyeRect(isLeft: false, packing: stereoPacking, swap: stereoSwap)
+        do {
+            try base.setParameter(name: "sclX", value: .float(l.scale.x))
+            try base.setParameter(name: "sclY", value: .float(l.scale.y))
+            try base.setParameter(name: "offLX", value: .float(l.origin.x))
+            try base.setParameter(name: "offLY", value: .float(l.origin.y))
+            try base.setParameter(name: "offRX", value: .float(r.origin.x))
+            try base.setParameter(name: "offRY", value: .float(r.origin.y))
+            try base.setParameter(name: "videoTexture", value: .textureResource(surface.textureResource))
+        } catch {
+            report("[xr-stereo] 立体材质参数设置失败: \(error.localizedDescription)")
+            return nil
+        }
+        return base
+    }
+
 
     /// 摆正面片(纹理转正 + 等比定形,二合一,幂等)。两块屏共用,AV 与 mpv 同时摆正。
     ///
@@ -296,10 +632,137 @@ final class VerifyModel {
     /// 暂停/继续:同步切换 mpv 与 AVPlayer,两屏一起冻结,便于逐帧色彩/画质比对。
     func togglePause() {
         isPaused.toggle()
+        tuning.isPaused = isPaused        // 镜像给调参面板,按钮文案随之变(▶/⏸)
         mpv.setPaused(isPaused)
         // 暂停:把 AV 定格到 mpv 当前帧(两屏同帧比对);继续:对齐后一起播。
         syncAVToMpv(play: !isPaused)
         report(isPaused ? "已暂停(两屏定格同一帧)" : "已继续(已对齐时间线)")
+    }
+
+    /// 连续漂移校正(bug2):两屏只在 PLAYBACK_RESTART 对齐一次会随各自时钟漂移。由调参轮询(~3Hz)持续调用:
+    /// 播放中 |av−mpv| 超阈值就把 AV 重对齐到 mpv 主钟,把漂移钳在一帧上下。
+    /// (绝对帧锁两套解码管线做不到;严格逐帧对照仍用「暂停 + seek 2s/27s」那条精确路。)
+    func correctDriftIfNeeded() {
+        guard mpvStarted, !isPaused else { return }
+        guard let mt = mpv.currentTime(), let at = av.currentTime() else { return }
+        if abs(mt - at) > driftTolerance { av.seek(to: mt) }
+    }
+
+    /// 切 roll-off 归属(消费端,热切,无需重载视频):
+    /// on=true → RealityKit 折 >1.0 + 把 mpv tone-mapping 设为 clip(互斥,避免双重压缩);
+    /// on=false → RealityKit 直通 + mpv 用面板选的曲线做软肩。
+    func setRealityKitToneMap(on: Bool) {
+        realityKitToneMap = on
+        tuning.rollOffRealityKit = on
+        rebuildMaterials()
+        let mpvTone = on ? "clip" : (tuning.values["tone-mapping"] ?? "bt.2390")
+        mpv.setColorProperty("tone-mapping", mpvTone)
+        report(on ? "roll-off 归属=RealityKit(mpv tone-mapping=clip)" : "roll-off 归属=mpv(tone-mapping=\(mpvTone))")
+    }
+
+    /// EDR 曝光乘子(消费端衰减 + target-peak 提亮):
+    /// <1 → tint 灰度即时衰减;>1 → 联动 mpv target-peak = 406×m 提亮。拉到画面不再变亮即触到系统 headroom 上限。
+    func setEdrExposure(_ m: Double) {
+        edrExposure = m
+        tuning.edrExposure = m
+        rebuildMaterials()
+        if m > 1.0 {
+            let peak = Int((exposurePeakBase * m).rounded())
+            mpv.setColorProperty("target-peak", String(peak))
+            tuning.values["target-peak"] = String(peak)
+            report("EDR 曝光 ×\(String(format: "%.2f", m)) → target-peak=\(peak)")
+        } else {
+            report("EDR 曝光 ×\(String(format: "%.2f", m))(消费端衰减)")
+        }
+    }
+
+    /// [xr-perf 杠杆2] 切像素格式路由模式(调参开关)。换格式要重建 IOSurface,故走 reload
+    /// (重建面 + 重启 mpv 套用对应色彩选项);未起播则只存模式,下次起播生效。
+    func setRouteMode(_ m: XRRouteMode) {
+        routeMode = m
+        tuning.routeMode = m
+        if mpvStarted {
+            report("像素格式路由 → \(m.label),重载生效…")
+            reloadAtNativeResolution()
+        } else {
+            report("像素格式路由 → \(m.label)(下次起播生效)")
+        }
+    }
+
+    /// [xr-perf 杠杆A·调试] 开关渲染分辨率上限(硬吃应急,非正解)。同样走 reload 重建。
+    func setResolutionCap(_ longEdge: Int) {
+        xrMaxLongEdge = longEdge
+        tuning.resolutionCapOn = longEdge > 0
+        if mpvStarted {
+            report("分辨率上限 → \(longEdge == 0 ? "原生" : String(longEdge)),重载生效…")
+            reloadAtNativeResolution()
+        } else {
+            report("分辨率上限 → \(longEdge == 0 ? "原生" : String(longEdge))(下次起播生效)")
+        }
+    }
+
+    /// [xr-perf 测量] 冻结消费端换材质(mpv 继续播)。摘掉每帧换材质提交 + RealityKit 重摄取拷贝
+    /// (假设 B+C),只留纯采样。真机读 perf HUD 的 renderFPS 分清瓶颈:
+    /// ① 冻结 → renderFPS 跳升 = 拷贝/换材质是墙(B+C),重构对症;
+    /// ② 冻结后不变,再按暂停(停 mpv)→ 跳升 = 生产端 GPU 争用;
+    /// ③ 冻结 + 暂停都不变 = 纯采样/两极(A)→ 走 mipmap/几何。
+    /// 注:冻结时画面停在最后一帧并可能撕裂(mpv 仍在写环),只为测帧率,非视觉验证。
+    func setFreezeSwap(_ on: Bool) {
+        VideoFrameSystem.freezeSwap = on
+        tuning.freezeSwap = on
+        report(on ? "❄️ 冻结换材质(mpv 继续播)— 读 renderFPS:跳升=拷贝/换材质是墙" : "已恢复换材质")
+    }
+
+    /// 当前真实片源 URL(重载/探测用);testsrc 无 URL 返回 nil。
+    private var currentSourceURL: URL? { scopedURL ?? currentAVURL }
+
+    /// 重载(bug3 + 卡死自救):按当前片源原生分辨率重建 IOSurface 环 + 重启 mpv,免杀后台。
+    /// 分辨率不能热切(IOSurface 必须在 mpv 加载前按尺寸建好),故走这条整重启路。换片也走它。
+    func reloadAtNativeResolution() {
+        guard surface != nil else { report("重载需先起播(选模式进入)"); return }
+        Task { @MainActor in
+            let url = currentSourceURL
+            if let url, let sz = await av.naturalSize(url: url), sz.width > 0, sz.height > 0 {
+                (width, height) = cappedRenderSize(Int(sz.width), Int(sz.height))
+            }
+            await resolveRoute(url: url)
+            report("重载 → \(width)x\(height) route=\(currentRoute.rawValue) …")
+            // 1. 停 mpv(异步清理),等彻底退出再重建,避免两个 mpv 抢同一 IOSurface。
+            if mpvStarted {
+                await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+                    mpv.stop { cont.resume() }
+                }
+                mpvStarted = false
+            }
+            // 2. 按原生尺寸重建 surface 环并重绑(沿用当前 toneMap/曝光状态)。
+            do {
+                self.surface = try ResidentVideoSurface(width: width, height: height, route: currentRoute)
+                rebindCurrentMode()   // 新 surface → 按当前模式重绑(平面/球/窗口)
+            } catch {
+                report("重载建 surface 失败: \(error.localizedDescription)"); return
+            }
+            // 3. 重启 mpv 渲染进新 surface。
+            guard let s = self.surface else { return }
+            do {
+                let src = url?.path ?? "av://lavfi:testsrc2=size=\(width)x\(height):rate=30"
+                try mpv.start(source: src, surfaceIDs: s.iosurfaceIDs, width: width, height: height, route: s.route)
+                mpvStarted = true
+                replayTuning()                       // 把用户调过的旋钮重放到新 handle
+                startPresenter()                      // 重启零拷贝换帧驱动(surface 已重建)
+                if avEnabled, let url { attachAV(url: url) }     // 重接 AV 对照(同源、重定 aspect)
+                report("重载完成 \(width)x\(height) ✓")
+            } catch {
+                report("重载启动 mpv 失败: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    /// 重启后把面板上用户调过的可写旋钮重放到新 mpv handle(mpv.start 只设了出厂默认)。
+    private func replayTuning() {
+        for p in TuneInventory.writable {
+            if let v = tuning.values[p.prop] { mpv.setColorProperty(p.prop, v) }
+        }
+        if realityKitToneMap { mpv.setColorProperty("tone-mapping", "clip") }   // 维持与 RealityKit 的互斥
     }
 
     /// [xr-verify] headless 自驱(模拟器自动验证,env XR_HEADLESS_VERIFY 触发):**不进沉浸空间、
@@ -323,7 +786,7 @@ final class VerifyModel {
             let (mpvSource, avURL) = resolveSources()
             currentAVURL = avURL
             try mpv.start(source: mpvSource, surfaceIDs: surface.iosurfaceIDs,
-                          width: width, height: height)
+                          width: surface.width, height: surface.height)
             mpvStarted = true
             report("[xr-verify] headless 自驱:mpv 已启动 src=\(mpvSource) | 首帧后自动 Gate 1")
         } catch {
@@ -414,6 +877,27 @@ final class VerifyModel {
         }
     }
 
+    /// [xr-stereo] 立体材质加载自测(路 B 命门):验证手写 StereoMaterial.usda 能被 RealityKit
+    /// 解析(info:id 是否抠对)+ promote 参数是否可见。成功 = 真景深的 ShaderGraph 路打通。
+    /// 模拟器只渲单眼,故这里只验"加载/参数",真分眼仍真机签。
+    func testStereoMaterialLoad() {
+        Task { @MainActor in
+            await loadStereoMaterialIfNeeded()
+            guard let mat = stereoBaseMaterial else {
+                logger.error("[xr-stereo] load FAILED")
+                return
+            }
+            let params = mat.parameterNames.sorted().joined(separator: ",")
+            logger.info("[xr-stereo] load OK params=\(params, privacy: .public)")
+            // 验参数面:确认 videoTexture / UV 参数名存在(真分眼真机签;此处只验加载 + 参数通路,
+            // 不建 ResidentVideoSurface —— LLDR 零拷贝路径需真机,模拟器会抛)。
+            let need = ["videoTexture", "sclX", "sclY", "offLX", "offLY", "offRX", "offRY"]
+            let missing = need.filter { !mat.parameterNames.contains($0) }
+            report(missing.isEmpty ? "[xr-stereo] 加载✓ 参数面齐全✓(videoTexture + UV 拆半,真分眼真机签)"
+                                   : "[xr-stereo] 加载✓ 但缺参数: \(missing.joined(separator: ","))")
+        }
+    }
+
     /// 进程物理内存占用(MB)。过夜运行穿插监控,防内存爆满(Phase E)。
     private func currentMemoryFootprintMB() -> Double {
         var info = task_vm_info_data_t()
@@ -430,7 +914,13 @@ final class VerifyModel {
     /// 片源:文件选择器选过片就用它(mpv 与 AVFoundation 共用同一 URL 做公平比对);
     /// 模拟器上文件选择器空白,故若已把样片 push 进 Documents 则自动取用;
     /// 都没有则退回 mpv 内建 testsrc2 合成图样(无解码,仅验证输出通路)。
+    /// [xr-bench] 投影开销对照夹具的源覆盖(直读路径,无安全作用域)。
+    var benchSource: String?
+
     private func resolveSources() -> (mpv: String, av: URL?) {
+        if let p = benchSource {
+            return (p, URL(fileURLWithPath: p))
+        }
         if let url = scopedURL {
             return (url.path, url)
         }
@@ -458,15 +948,20 @@ final class VerifyModel {
         }
         scopedURL = url
         if mpvStarted {
-            mpv.loadFile(url.path)
-            report("换片 → \(url.lastPathComponent) | 看状态末行确认硬/软解")
+            // 换片 = 可能换分辨率 → 走重载(按原生尺寸重建 IOSurface + 重启 mpv + 重接 AV)。
+            report("换片 → \(url.lastPathComponent),按原生分辨率重载…")
+            reloadAtNativeResolution()
         } else {
-            report("已选 \(url.lastPathComponent),进入沉浸场景后播放")
-        }
-        // AV 对照随选片接入/重连:已进沉浸场景(world 在)就把同一片源接到对照屏。
-        // 旧逻辑只在 enableMpv 接一次,「先启动 mpv 再选片」会漏掉对照组——这里补上。
-        if world != nil {
-            attachAV(url: url)
+            // 未起播:先探原生分辨率,下次建 surface 就按它(首帧即原生,不必再重载)。
+            Task { @MainActor in
+                if let sz = await av.naturalSize(url: url), sz.width > 0, sz.height > 0 {
+                    (self.width, self.height) = self.cappedRenderSize(Int(sz.width), Int(sz.height))
+                }
+                await self.resolveRoute(url: url)
+                self.report("已选 \(url.lastPathComponent) \(self.width)x\(self.height) \(self.currentRoute.rawValue),进入沉浸后播放")
+            }
+            // AV 对照随选片接入/重连:已进沉浸场景(world 在)就把同一片源接到对照屏。
+            if avEnabled, world != nil { attachAV(url: url) }
         }
     }
 
@@ -484,6 +979,7 @@ final class VerifyModel {
     }
 
     func stop() {
+        VideoFrameSystem.onFrameTick = nil
         mpv.stop()
         av.stop()
         if let url = scopedURL {

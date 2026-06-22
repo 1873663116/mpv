@@ -4,9 +4,11 @@
  * 让 vo_gpu_next 把视频帧渲染进「常驻的、IOSurface-backed 的」可渲染纹理,
  * 该 IOSurface 可经 IOSurfaceID 交给外部(Swift / RealityKit)零拷贝共享。
  *
- * 门①(共享纹理写/读同步,见 ADR 0003):用 2 张 IOSurface 双缓冲环——
- * mpv 在两张之间交替写「后台缓冲」,渲染+同步完成后把它「发布」为最新完整帧;
+ * 门①(共享纹理写/读同步,见 ADR 0003/0010):用 3 张 IOSurface 三缓冲环——
+ * mpv 轮流写「后台缓冲」,渲染完成后把「上一帧」那张发布为最新完整帧(延迟一帧发布);
  * 消费方(RealityKit)只读已发布的那张,绝不读 mpv 正在写的那张 → 无撕裂。
+ * 三缓冲让「正写 / 待发布 / 消费中」三张互不重叠,从而能把每帧 pl_gpu_finish 全停
+ * 换成 pl_gpu_flush(非阻塞)+ 只等上一帧的 pl_tex_poll,渲染与消费并行(ADR 0011)。
  *
  * 参考:video/out/hwdec/hwdec_vt_pl.m(VideoToolbox → 可采样 pl_tex 的导入范例)。
  * 设计依据:ADR 0001 / 0002 / 0003。
@@ -29,7 +31,7 @@
 #include "common/msg.h"
 #include "video/out/vulkan/common.h"
 
-#define XR_RING_MAX 2
+#define XR_RING_MAX 3
 
 // 取得 MoltenVK 实际使用的 MTLDevice(纹理必须与 MoltenVK 同 device)。
 static id<MTLDevice> xr_get_moltenvk_device(pl_gpu gpu)
@@ -68,11 +70,20 @@ struct xr_buf {
 };
 static struct xr_buf g_res[XR_RING_MAX];
 
+// [xr] 出口像素格式(色彩路由,见 ADR 0004/0005):按源 HDR 与否选最省带宽的格式。
+//   fp16 RGBA('RGhA')= 扩展线性 Display P3,承载 HDR(>1.0 线性光),8 字节/像素。
+//   8-bit RGBA('RGBA')= IEC sRGB 编码 Display P3,SDR 专用,4 字节/像素(带宽腰斩)。
+// 由 configure 时读 IOSurfaceGetPixelFormat 自动识别,无需改 API 签名。
+#define XR_PIXFMT_FP16  0x52476841u // 'RGhA' = kCVPixelFormatType_64RGBAHalf
+#define XR_PIXFMT_RGBA8 0x52474241u // 'RGBA' = kCVPixelFormatType_32RGBA
+
 // 外部 IOSurface 描述(由 Swift 配置)。
 struct xr_ext { uint32_t id; int w, h; };
 static struct xr_ext g_ext[XR_RING_MAX];
 static int g_count;        // 已配置的外部 IOSurface 数(0 = 无外部,走内部回落)
+static uint32_t g_pixfmt = XR_PIXFMT_FP16; // 当前出口像素格式(默认 fp16;无外部回落亦用它)
 static int g_write_idx;    // 下一帧写哪个环缓冲
+static int g_pending_idx = -1; // 已渲染并提交、待下一帧发布的缓冲(-1=无;三缓冲流水线)
 static _Atomic uint32_t g_front_id; // 最新完整 IOSurfaceID(消费方读它)
 static _Atomic bool g_enabled; // 模式开关:沉浸=true、窗口=false(替代环境变量,线程安全)
 // 串行化 app 线程(configure/clear)与 VO 渲染线程(back_tex/publish/destroy)
@@ -87,7 +98,7 @@ bool xr_resident_enabled(void) { return atomic_load(&g_enabled); }
 
 void xr_resident_destroy(pl_gpu gpu);
 pl_tex xr_resident_back_tex(struct mp_log *log, pl_gpu gpu, int w, int h, uint32_t *out_id);
-void xr_resident_publish_front(uint32_t iosurface_id);
+void xr_resident_submit_back(pl_gpu gpu);
 bool xr_resident_external_size(int *w, int *h);
 
 static inline int xr_ring_count(void)
@@ -102,27 +113,33 @@ bool xr_resident_configure_external_iosurfaces(const uint32_t *ids, int count,
         return false;
 
     struct xr_ext staged[XR_RING_MAX] = {0};
+    uint32_t staged_pixfmt = 0;
     for (int i = 0; i < count; i++) {
         if (!ids[i])
             return false;
         IOSurfaceRef io = IOSurfaceLookup(ids[i]);
         if (!io)
             return false;
+        uint32_t pf = (uint32_t)IOSurfaceGetPixelFormat(io);
+        // [xr] 色彩路由:接受 fp16(HDR)或 8-bit RGBA(SDR);全环必须同格式,否则
+        // 绑定纹理会颜色错乱却不报错。格式由 Swift 端按源 HDR 与否选定(ADR 0004/0005)。
         bool ok = IOSurfaceGetWidth(io) == (size_t)width &&
                   IOSurfaceGetHeight(io) == (size_t)height &&
-                  // [xr] 像素格式必须是 fp16 RGBA(64RGBAHalf / 'RGhA'),与渲染目标
-                  // (RGBA16Float)及内部自建缓冲一致;否则绑定纹理会颜色错乱却不报错。
-                  IOSurfaceGetPixelFormat(io) == 0x52476841;
+                  (pf == XR_PIXFMT_FP16 || pf == XR_PIXFMT_RGBA8) &&
+                  (staged_pixfmt == 0 || staged_pixfmt == pf);
         CFRelease(io);
         if (!ok)
             return false;
+        staged_pixfmt = pf;
         staged[i] = (struct xr_ext){ .id = ids[i], .w = width, .h = height };
     }
 
     pthread_mutex_lock(&g_lock);
     memcpy(g_ext, staged, sizeof(g_ext));
+    g_pixfmt = staged_pixfmt;
     g_count = count;
     g_write_idx = 0;
+    g_pending_idx = -1;
     atomic_store(&g_front_id, 0);
     pthread_mutex_unlock(&g_lock);
     return true;
@@ -133,9 +150,20 @@ void xr_resident_clear_external_iosurface(void)
     pthread_mutex_lock(&g_lock);
     memset(g_ext, 0, sizeof(g_ext));
     g_count = 0;
+    g_pixfmt = XR_PIXFMT_FP16;
     g_write_idx = 0;
+    g_pending_idx = -1;
     atomic_store(&g_front_id, 0);
     pthread_mutex_unlock(&g_lock);
+}
+
+// [xr] 色彩路由查询(vo_gpu_next 据此设渲染目标传递曲线):
+//   8-bit 出口 = IEC sRGB 编码(libplacebo 在 shader 里编码,消费端 `_srgb` 视图硬件解码,互逆);
+//   fp16 出口 = 扩展线性(消费端直采)。返回 true = 当前出口要 sRGB 编码。
+bool xr_resident_target_is_srgb(void);
+bool xr_resident_target_is_srgb(void)
+{
+    return atomic_load(&g_enabled) && g_pixfmt == XR_PIXFMT_RGBA8;
 }
 
 bool xr_resident_external_size(int *w, int *h)
@@ -179,6 +207,7 @@ void xr_resident_destroy(pl_gpu gpu)
     pthread_mutex_lock(&g_lock);
     for (int i = 0; i < XR_RING_MAX; i++)
         xr_destroy_buf(gpu, i);
+    g_pending_idx = -1;
     pthread_mutex_unlock(&g_lock);
 }
 
@@ -213,18 +242,22 @@ static bool xr_ensure_buf(struct mp_log *log, pl_gpu gpu, int idx, int w, int h)
             return false;
         }
 
+        // [xr] 色彩路由(ADR 0004/0005):8-bit 出口 = IEC sRGB 编码字节(SDR,4 字节/像素,
+        // 带宽腰斩);fp16 出口 = 扩展线性 Display P3(HDR,8 字节/像素)。mpv 写入侧统一用
+        // plain(非 _srgb)Metal 视图——libplacebo 在 shader 里按渲染目标 transfer 编码,
+        // 消费端再以 `.rgba8Unorm_srgb` 视图硬件解码,严格互逆(见 ADR 0004)。
+        bool eightbit = (g_pixfmt == XR_PIXFMT_RGBA8);
+
         IOSurfaceRef io = NULL;
         if (want_external) {
             io = IOSurfaceLookup(want_id);
         } else {
-            // [xr] HDR 出口(ADR 0005):fp16 RGBA(每像素 8 字节)承载扩展线性 Display P3。
-            // 外部 IOSurface 由 Swift 端以同格式创建(kCVPixelFormatType_64RGBAHalf);
-            // 这里的内部自建仅在「未配置外部 IOSurface」的回落路径用到,格式须与之一致。
+            // 内部自建仅用于「未配置外部 IOSurface」的回落路径,默认 fp16(g_pixfmt 此时为默认值)。
             NSDictionary *props = @{
                 (id)kIOSurfaceWidth:           @(w),
                 (id)kIOSurfaceHeight:          @(h),
-                (id)kIOSurfaceBytesPerElement: @(8),
-                (id)kIOSurfacePixelFormat:     @(0x52476841), // 'RGhA' = kCVPixelFormatType_64RGBAHalf
+                (id)kIOSurfaceBytesPerElement: @(eightbit ? 4 : 8),
+                (id)kIOSurfacePixelFormat:     @(eightbit ? XR_PIXFMT_RGBA8 : XR_PIXFMT_FP16),
             };
             io = IOSurfaceCreate((CFDictionaryRef)props);
         }
@@ -235,7 +268,8 @@ static bool xr_ensure_buf(struct mp_log *log, pl_gpu gpu, int idx, int w, int h)
         }
 
         MTLTextureDescriptor *desc =
-            [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA16Float
+            [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:
+                (eightbit ? MTLPixelFormatRGBA8Unorm : MTLPixelFormatRGBA16Float)
                                                                width:w height:h mipmapped:NO];
         desc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
         desc.storageMode = MTLStorageModeShared;
@@ -246,9 +280,12 @@ static bool xr_ensure_buf(struct mp_log *log, pl_gpu gpu, int idx, int w, int h)
             return false;
         }
 
-        pl_fmt fmt = pl_find_fmt(gpu, PL_FMT_FLOAT, 4, 16, 16, PL_FMT_CAP_RENDERABLE);
+        pl_fmt fmt = eightbit
+            ? pl_find_fmt(gpu, PL_FMT_UNORM, 4, 8, 8, PL_FMT_CAP_RENDERABLE)
+            : pl_find_fmt(gpu, PL_FMT_FLOAT, 4, 16, 16, PL_FMT_CAP_RENDERABLE);
         if (!fmt) {
-            mp_msg(log, MSGL_ERR, "[xr] 找不到 renderable rgba16f pl_fmt\n");
+            mp_msg(log, MSGL_ERR, "[xr] 找不到 renderable %s pl_fmt\n",
+                   eightbit ? "rgba8" : "rgba16f");
             [mt release];
             CFRelease(io);
             return false;
@@ -279,13 +316,14 @@ static bool xr_ensure_buf(struct mp_log *log, pl_gpu gpu, int idx, int w, int h)
         b->iosurface_id = IOSurfaceGetID(io);
         b->external = want_external;
         mp_msg(log, MSGL_INFO,
-               "[xr] 常驻 IOSurface[%d] 纹理就绪 %dx%d IOSurfaceID=%u %s\n",
-               idx, w, h, b->iosurface_id, want_external ? "(external)" : "(internal)");
+               "[xr] 常驻 IOSurface[%d] 纹理就绪 %dx%d %s IOSurfaceID=%u %s\n",
+               idx, w, h, eightbit ? "RGBA8/sRGB" : "RGBA16F/linear",
+               b->iosurface_id, want_external ? "(external)" : "(internal)");
         return true;
     }
 }
 
-// 双缓冲:取下一帧要写的「后台缓冲」纹理(在环上交替,避开当前 front)。
+// 三缓冲:取下一帧要写的「后台缓冲」纹理(在环上轮转,避开当前 front 与待发布)。
 pl_tex xr_resident_back_tex(struct mp_log *log, pl_gpu gpu, int w, int h, uint32_t *out_id)
 {
     pthread_mutex_lock(&g_lock);
@@ -299,11 +337,26 @@ pl_tex xr_resident_back_tex(struct mp_log *log, pl_gpu gpu, int w, int h, uint32
     return tex;
 }
 
-// 渲染+同步完成后调用:把刚写完的后台缓冲发布为 front,并把写指针移到另一张。
-void xr_resident_publish_front(uint32_t iosurface_id)
+// 提交本帧渲染并发布上一帧(三缓冲流水线,ADR 0011)。取代旧的「pl_gpu_finish 全停 + 立即发布」:
+//   1) pl_gpu_finish 抽干整条 GPU 队列、每帧阻塞 → 吞吐被串行化(360 4K 实测掉到 ~10fps)。
+//   2) 改为 pl_gpu_flush(仅提交、不阻塞)+ 只对「上一帧」那张缓冲 pl_tex_poll 等其写完再发布。
+//      上一帧已过了一整个帧间隔,几乎必然完成 → 等待近乎为零;本帧 GPU 工作与 RealityKit 消费并行。
+//      三缓冲保证「正写 / 待发布 / 消费中」三张互不重叠,故无撕裂。
+// pl_tex_poll 正是 libplacebo 文档点名的用法:外部内存(IOSurface)需知导入纹理何时写完、可安全移交。
+// 注:跨设备信号量(pl_vulkan_hold/release)移交是后续优化,但 RealityKit 侧无等待钩子,故在
+// 生产者侧用 poll 保证写完是正确做法,而非权宜。
+void xr_resident_submit_back(pl_gpu gpu)
 {
+    pl_gpu_flush(gpu); // 非阻塞提交本帧渲染,确保其尽快入队,流水线才能真正重叠
     pthread_mutex_lock(&g_lock);
-    atomic_store(&g_front_id, iosurface_id);
+    if (g_pending_idx >= 0 && g_res[g_pending_idx].tex) {
+        // 只等上一帧那张写完(稳态下几乎即时);不等本帧 → 实现流水线。
+        while (pl_tex_poll(gpu, g_res[g_pending_idx].tex, UINT64_MAX))
+            ; // 自旋直到 GPU 不再占用该纹理
+        atomic_store(&g_front_id, g_res[g_pending_idx].iosurface_id);
+    }
+    // 本帧(g_write_idx 指向、刚渲染的那张)成为下一次待发布;写指针轮到下一张。
+    g_pending_idx = g_write_idx % xr_ring_count();
     g_write_idx = (g_write_idx + 1) % xr_ring_count();
     pthread_mutex_unlock(&g_lock);
 }

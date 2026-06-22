@@ -25,8 +25,9 @@ final class MpvPlayer {
 
     /// - Parameter source: mpv loadfile 目标。文件路径(与 AVFoundation 对照组同一片源做公平比对),
     ///   或 `av://lavfi:testsrc2=...` 等无片源时的内建图样。
-    func start(source: String, surfaceIDs: [UInt32], width: Int, height: Int) throws {
-        dbg.info("[xr-start] 1 配置外部 IOSurface ids=\(surfaceIDs, privacy: .public) …")
+    func start(source: String, surfaceIDs: [UInt32], width: Int, height: Int,
+               route: XRColorRoute = .hdr16) throws {
+        dbg.info("[xr-start] 1 配置外部 IOSurface ids=\(surfaceIDs, privacy: .public) route=\(route.rawValue, privacy: .public) …")
         xr_resident_set_enabled(true)
         let ok = surfaceIDs.withUnsafeBufferPointer { buf in
             xr_resident_configure_external_iosurfaces(buf.baseAddress, Int32(buf.count),
@@ -57,7 +58,7 @@ final class MpvPlayer {
         try setOption("hwdec", "videotoolbox")
         // [xr] 无窗 surfaceless 出口:GPU 设备无 surface,直接渲染进外部 IOSurface(ADR 0003)。
         try setOption("gpu-context", "macvk_resident")
-        for (name, value) in Self.colorOptions() {
+        for (name, value) in Self.colorOptions(for: route) {
             try setOption(name, value)
         }
 
@@ -193,8 +194,18 @@ final class MpvPlayer {
         ProcessInfo.processInfo.environment[key] ?? def
     }
 
-    private static func colorOptions() -> [(String, String)] {
-        [
+    private static func colorOptions(for route: XRColorRoute) -> [(String, String)] {
+        // [xr-perf 杠杆2] SDR 路:源即 SDR,只需把出口编成 IEC sRGB、原色落 Display P3。
+        // 不需要 HDR tone-map/动态测峰(对 SDR 源是 no-op)。target-trc=srgb 必须与 vo 端
+        // 渲染目标 transfer(xr_resident_target_is_srgb 路由)一致,否则编码与消费端解码不互逆。
+        if route == .sdr8 {
+            return [
+                ("target-colorspace-hint", env("XR_CS_HINT", "no")),
+                ("target-prim", env("XR_TARGET_PRIM", "display-p3")),
+                ("target-trc", "srgb"),
+            ]
+        }
+        return [
             // 焊死契约(改它需放弃 mpv 出口)
             ("target-colorspace-hint", env("XR_CS_HINT", "no")),
             ("target-prim", env("XR_TARGET_PRIM", "display-p3")),

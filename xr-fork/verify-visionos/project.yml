@@ -2,7 +2,7 @@ name: VerifyVisionOS
 options:
   bundleIdPrefix: com.enchron
   deploymentTarget:
-    visionOS: "2.0"
+    visionOS: "27.0"
   createIntermediateGroups: true
 
 # 本地 MPVKit 包:其 Package.swift 已把 Libmpv target 指向本仓库本地构建的
@@ -26,7 +26,7 @@ targets:
   VerifyVisionOS:
     type: application
     platform: visionOS
-    deploymentTarget: "2.0"
+    deploymentTarget: "27.0"
     sources:
       - path: Sources/App
       # Resources/ 里的 .reality 场景与可选 sample.mp4 —— xcodegen 按类型归入 Copy Resources。
@@ -64,3 +64,21 @@ targets:
         DEVELOPMENT_TEAM: JFLYK8F636
         ENABLE_PREVIEWS: YES
         SWIFT_VERSION: "5.0"
+
+  # 全景几何确定性验收(SPEC §4 🤖 通道)。直接编入 PanoramaMesh.swift(只依赖 RealityKit),
+  # 不挂 host app、不链 MPVKit —— 纯数据断言可在模拟器无 UI 跑。
+  PanoramaMeshTests:
+    type: bundle.unit-test
+    platform: visionOS
+    deploymentTarget: "2.0"
+    sources:
+      - path: Tests
+      - path: Sources/App/PanoramaMesh.swift
+      - path: Sources/App/StereoLayout.swift
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.enchron.VerifyVisionOS.PanoramaMeshTests
+        CODE_SIGN_STYLE: Automatic
+        DEVELOPMENT_TEAM: JFLYK8F636
+        SWIFT_VERSION: "5.0"
+        GENERATE_INFOPLIST_FILE: YES

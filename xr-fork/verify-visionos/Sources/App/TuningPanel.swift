@@ -113,6 +113,9 @@ final class TuningStore {
     var mSat = 0.0
     var mGt2 = 0.0
     var metricsLive = false
+    /// [xr-perf] 实时仪表(fp16 色彩采样)总开关,默认**关**。开启会每 poll tick 在主线程锁 IOSurface
+    /// 并遍历整帧像素(随分辨率涨,8K 每秒数百万次 + 大数组排序),是自伤性卡顿源 —— 仅 fp16 调色时手动开。
+    var metricsEnabled = false
     /// 进度条。
     var pos = 0.0
     var dur = 0.0
@@ -121,6 +124,17 @@ final class TuningStore {
     var slotA: [String: String]?
     var slotB: [String: String]?
     var lastExport = ""
+    /// 暂停态镜像(由 VerifyModel.togglePause 同步;面板按钮文案用)。
+    var isPaused = false
+    /// roll-off 归属:false=mpv 软肩,true=RealityKit tone map(二者互斥)。
+    var rollOffRealityKit = false
+    /// EDR 曝光乘子:<1 消费端衰减,>1 联动 target-peak 提亮。
+    var edrExposure = 1.0
+    /// [xr-perf 杠杆2] 像素格式路由模式(自动/强制)+ 分辨率上限调试开关。改它走 reload 重建面。
+    var routeMode: XRRouteMode = .auto
+    var resolutionCapOn = false
+    /// [xr-perf 测量] 冻结换材质开关(诊断:摘掉换材质/重摄取,只留采样;读 renderFPS 定瓶颈)。
+    var freezeSwap = false
 
     // 由 VerifyModel 接线的回调:
     var setCb: (String, String) -> Void = { _, _ in }
@@ -129,6 +143,19 @@ final class TuningStore {
     var toggleCb: () -> Void = {}
     var sampleCb: () -> (gt1: Double, p1: Double, sat: Double, gt2: Double)? = { nil }
     var timeCb: () -> (pos: Double, dur: Double)? = { nil }
+    /// 连续漂移校正(每轮询 tick 调一次,VerifyModel 决定是否重对齐)。
+    var syncCb: () -> Void = {}
+    /// 重载视频(重建 IOSurface 按原生分辨率 + 重启 mpv,免杀后台)。
+    var reloadCb: () -> Void = {}
+    /// 切 roll-off 归属(true=RealityKit)。
+    var rollOffCb: (Bool) -> Void = { _ in }
+    /// 改 EDR 曝光乘子。
+    var exposureCb: (Double) -> Void = { _ in }
+    /// [xr-perf 杠杆2] 切像素格式路由模式 / 分辨率上限(均走 reload 重建面)。
+    var routeModeCb: (XRRouteMode) -> Void = { _ in }
+    var resolutionCapCb: (Bool) -> Void = { _ in }
+    /// [xr-perf 测量] 冻结/恢复消费端换材质。
+    var freezeSwapCb: (Bool) -> Void = { _ in }
 
     private let log = Logger(subsystem: "enchron.verify.visionos", category: "tune")
     private var poll: Task<Void, Never>?
@@ -200,12 +227,19 @@ final class TuningStore {
     }
 
     func seek(_ t: Double) { seekCb(t) }
+    func setRollOff(realityKit: Bool) { rollOffRealityKit = realityKit; rollOffCb(realityKit) }
+    func setExposure(_ m: Double) { edrExposure = m; exposureCb(m) }
+    func reload() { reloadCb() }
+    func setRouteMode(_ m: XRRouteMode) { routeMode = m; routeModeCb(m) }
+    func setResolutionCap(_ on: Bool) { resolutionCapOn = on; resolutionCapCb(on) }
+    func setFreezeSwap(_ on: Bool) { freezeSwap = on; freezeSwapCb(on) }
 
     private func startPolling() {
         poll?.cancel()
         poll = Task { @MainActor [weak self] in
             while let self, !Task.isCancelled {
-                if let m = self.sampleCb() {
+                self.syncCb()                       // 连续漂移校正(播放中把 AV 重对齐 mpv 主钟)
+                if self.metricsEnabled, let m = self.sampleCb() {   // 默认关:重采样仅调色时开,避免主线程卡顿
                     self.mGt1 = m.gt1; self.mP1 = m.p1; self.mSat = m.sat; self.mGt2 = m.gt2
                     self.metricsLive = true
                 }
@@ -231,7 +265,9 @@ struct TuningPanelView: View {
     var body: some View {
         List {
             Section("传输") { transport }
+            Section("出口格式 · 带宽(杠杆2)") { routing }
             Section("实时仪表 · fp16 字节(显示无关)") { metrics }
+            Section("消费端 · RealityKit(非 mpv)") { consumer }
             Section("配置") { config }
             Section("参数(5 个二级菜单)") {
                 ForEach(1...5, id: \.self) { g in
@@ -248,12 +284,13 @@ struct TuningPanelView: View {
     private var transport: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 12) {
-                Button("⏯ 播/暂停") { store.toggleCb() }
+                Button(store.isPaused ? "▶ 继续" : "⏸ 暂停") { store.toggleCb() }
                 Button("跳 2s") { store.scrubbing = false; jump(2) }
                 Button("跳 27s") { store.scrubbing = false; jump(27) }
                 Spacer()
                 Text(timeLabel).font(.system(size: 12, design: .monospaced)).foregroundStyle(.secondary)
             }
+            .buttonStyle(.borderless)   // List 行内多按钮必须显式 borderless,否则整行被当一个点击目标
             Slider(value: Binding(get: { store.pos }, set: { store.pos = $0 }),
                    in: 0...max(store.dur, 0.1),
                    onEditingChanged: { editing in
@@ -268,24 +305,88 @@ struct TuningPanelView: View {
         return "\(f(store.pos)) / \(f(store.dur))"
     }
 
-    private var metrics: some View {
-        Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 4) {
-            GridRow {
-                metricCell(">1.0 高光", String(format: "%.2f%%", store.mGt1), good: store.mGt1 > 3)
-                metricCell(">2.0 过曝", String(format: "%.2f%%", store.mGt2), good: store.mGt2 < 1, lowerBetter: true)
+    /// [xr-perf 杠杆2] 出口像素格式路由 + 分辨率上限调试开关(改任一会重载一次)。
+    private var routing: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Picker("像素格式", selection: Binding(
+                get: { store.routeMode },
+                set: { store.setRouteMode($0) })) {
+                Text("自动").tag(XRRouteMode.auto)
+                Text("SDR 8bit").tag(XRRouteMode.forceSDR)
+                Text("HDR fp16").tag(XRRouteMode.forceHDR)
             }
-            GridRow {
-                metricCell("黑位 p1", String(format: "%.4f", store.mP1), good: store.mP1 < 0.001, lowerBetter: true)
-                metricCell("饱和 p90", String(format: "%.3f", store.mSat), good: store.mSat > 0.25)
-            }
+            .pickerStyle(.segmented)
+            Text("自动 = 读源元数据:SDR→8-bit sRGB(带宽腰斩、无损);HDR→fp16 线性。切换重载一次。")
+                .font(.system(size: 11)).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Toggle("分辨率上限 1920(调试 · 硬吃)", isOn: Binding(
+                get: { store.resolutionCapOn },
+                set: { store.setResolutionCap($0) }))
+            Text("应急杠杆,会降画质;正解是上面的格式路由。开/关都重载一次。")
+                .font(.system(size: 11)).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
         }
-        .font(.system(size: 13, design: .monospaced))
+    }
+
+    private var metrics: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Toggle("实时仪表(吃 CPU·仅 fp16 调色时开)", isOn: Binding(
+                get: { store.metricsEnabled },
+                set: { store.metricsEnabled = $0 }))
+            .font(.system(size: 12))
+            Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 4) {
+                GridRow {
+                    metricCell(">1.0 高光", String(format: "%.2f%%", store.mGt1), good: store.mGt1 > 3)
+                    metricCell(">2.0 过曝", String(format: "%.2f%%", store.mGt2), good: store.mGt2 < 1, lowerBetter: true)
+                }
+                GridRow {
+                    metricCell("黑位 p1", String(format: "%.4f", store.mP1), good: store.mP1 < 0.001, lowerBetter: true)
+                    metricCell("饱和 p90", String(format: "%.3f", store.mSat), good: store.mSat > 0.25)
+                }
+            }
+            .font(.system(size: 13, design: .monospaced))
+        }
     }
 
     private func metricCell(_ name: String, _ value: String, good: Bool, lowerBetter: Bool = false) -> some View {
         HStack(spacing: 6) {
             Text(name).foregroundStyle(.secondary)
             Text(value).foregroundStyle(good ? .green : .primary)
+        }
+    }
+
+    /// 消费端旋钮(RealityKit/材质,非 mpv):roll-off 归属 + EDR 曝光乘子。
+    private var consumer: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Picker("roll-off 归属", selection: Binding(
+                get: { store.rollOffRealityKit },
+                set: { store.setRollOff(realityKit: $0) })) {
+                Text("mpv 软肩").tag(false)
+                Text("RealityKit").tag(true)
+            }
+            .pickerStyle(.segmented)
+            Text("谁把 >1.0 高光压回可显范围。选 RealityKit 会自动把 mpv tone-mapping 设为 clip(二者互斥,避免双重压缩)。")
+                .font(.system(size: 11)).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            VStack(alignment: .leading, spacing: 2) {
+                HStack {
+                    Text("EDR 曝光")
+                    Spacer()
+                    Text(String(format: "×%.2f", store.edrExposure))
+                        .font(.system(size: 12, design: .monospaced)).foregroundStyle(.secondary)
+                }
+                Slider(value: Binding(get: { store.edrExposure }, set: { store.setExposure($0) }), in: 0.1...4.0)
+                Text("<1 = 消费端即时衰减;>1 = 联动 target-peak 提亮(基准 406)。拉到画面不再变亮 = 摸到系统 headroom 天花板。")
+                    .font(.system(size: 11)).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Divider()
+            Toggle("❄️ 冻结换材质(测量 · 非视觉)", isOn: Binding(
+                get: { store.freezeSwap },
+                set: { store.setFreezeSwap($0) }))
+            Text("诊断瓶颈:冻结后 mpv 继续播,只剩纯采样。看 perf HUD 的『渲染』fps —— 跳升=换材质/重摄取拷贝是墙(B+C);不变再按上面『暂停』,跳升=生产端争用、仍不变=采样/两极(A)。画面会冻/撕,只为测帧率。")
+                .font(.system(size: 11)).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
         }
     }
 
@@ -298,7 +399,12 @@ struct TuningPanelView: View {
                 Button("存B") { store.saveSlot("B") }
                 Button("用B") { store.loadSlot("B") }.disabled(store.slotB == nil)
             }
-            Button("导出当前配置 → 日志") { store.export() }
+            .buttonStyle(.borderless)
+            HStack(spacing: 10) {
+                Button("↻ 重载视频(换分辨率/卡死时)") { store.reload() }
+                Button("导出配置 → 日志") { store.export() }
+            }
+            .buttonStyle(.borderless)
             if !store.lastExport.isEmpty {
                 Text(store.lastExport)
                     .font(.system(size: 10, design: .monospaced))

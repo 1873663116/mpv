@@ -24,9 +24,8 @@ final class AVController {
         player?.pause()
 
         let item = AVPlayerItem(url: url)
-        // 720p 上限:与 mpv 出口同分辨率(双路都缩),省模拟器内存。分辨率与色彩格式
-        // (PQ/Rec2020/HDR)正交 —— 下采样不改变 HDR 性质,两屏仍是同源 HDR 比对(ADR 0005)。
-        item.preferredMaximumResolution = CGSize(width: 1280, height: 720)
+        // 不再限制分辨率:mpv 侧已改为按视频原生分辨率渲染(VerifyModel.reloadAtNativeResolution),
+        // 两屏同走原生、画质对齐。(旧 720p 上限是省模拟器内存的 hack,真机/对照不需要。)
         let player = AVPlayer(playerItem: item)
         player.actionAtItemEnd = .none
         self.player = player
@@ -150,6 +149,40 @@ final class AVController {
         let mean = chromas.reduce(0, +) / Float(chromas.count)
         let p90 = chromas.sorted()[Int(Float(chromas.count - 1) * 0.9)]
         return (mean, p90)
+    }
+
+    /// 当前播放时间(秒),用于把 AV 对照按 mpv 主钟做连续漂移校正(VerifyModel.correctDriftIfNeeded)。
+    /// 未就绪返回 nil。
+    func currentTime() -> Double? {
+        guard let player, let item = player.currentItem, item.status == .readyToPlay else { return nil }
+        let t = player.currentTime().seconds
+        return t.isFinite ? t : nil
+    }
+
+    /// [xr-perf 杠杆2] 路由探测:读视频轨元数据判断源是否 HDR(PQ/HLG 传递曲线或 BT.2020 原色)。
+    /// 供 VerifyModel 在建 IOSurface 前决定走 8-bit sRGB(SDR)还是 fp16(HDR)。读不到则保守按 HDR。
+    func probeIsHDR(url: URL) async -> Bool {
+        let asset = AVURLAsset(url: url)
+        guard let track = try? await asset.loadTracks(withMediaType: .video).first,
+              let formats = try? await track.load(.formatDescriptions),
+              let fd = formats.first else { return true }
+        let ext = (CMFormatDescriptionGetExtensions(fd) as? [CFString: Any]) ?? [:]
+        func str(_ key: CFString) -> String { (ext[key] as? String) ?? "" }
+        let prim = str(kCMFormatDescriptionExtension_ColorPrimaries)
+        let trc = str(kCMFormatDescriptionExtension_TransferFunction)
+        return trc.contains("2084") || trc.localizedCaseInsensitiveContains("HLG") || prim.contains("2020")
+    }
+
+    /// 探测视频原生显示分辨率(含 preferredTransform 方向校正)。用于按原生尺寸建 IOSurface(mpv 出口同分辨率)。
+    func naturalSize(url: URL) async -> CGSize? {
+        let asset = AVURLAsset(url: url)
+        guard let track = try? await asset.loadTracks(withMediaType: .video).first,
+              let size = try? await track.load(.naturalSize),
+              let xf = try? await track.load(.preferredTransform) else { return nil }
+        let r = size.applying(xf)
+        let w = abs(r.width), h = abs(r.height)
+        guard w > 0, h > 0 else { return nil }
+        return CGSize(width: w, height: h)
     }
 
     func stop() {

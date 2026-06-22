@@ -1,0 +1,111 @@
+#usda 1.0
+(
+    defaultPrim = "Root"
+    metersPerUnit = 1
+    upAxis = "Y"
+)
+
+# 立体视频材质(路 B 真景深):Camera Index Switch 让左/右眼采样纹理不同半幅。
+# 一个材质吃 mono/SBS/TB/swap —— UV 缩放与左右眼偏移全由 Swift(StereoLayout)经 promote 参数驱动。
+# 节点 id 逐字来自 Apple 官方 stereo 样例 + 真实工程(见 REPORT/调研)。
+# 几何仍是代码生成的朝内 equirect 球(本材质只管"怎么采样"),色彩契约:Unlit + 关 tone map。
+def Xform "Root"
+{
+    def Material "Material"
+    {
+        # ── Swift 运行时绑定的 promote 参数 ──
+        asset inputs:videoTexture                      # 逐帧 mpv 纹理(setParameter)
+        float inputs:sclX = 1                          # UV 缩放 x(SBS=0.5)
+        float inputs:sclY = 1                          # UV 缩放 y(TB=0.5)
+        float inputs:offLX = 0                         # 左眼 U 偏移
+        float inputs:offLY = 0                         # 左眼 V 偏移
+        float inputs:offRX = 0                         # 右眼 U 偏移(SBS=0.5)
+        float inputs:offRY = 0                         # 右眼 V 偏移(TB=0.5)
+
+        token outputs:mtlx:surface.connect = </Root/Material/UnlitSurface.outputs:out>
+        token outputs:realitykit:vertex
+
+        # 网格 equirect UV(代码球烘好的 [0,1])
+        def Shader "Texcoord"
+        {
+            uniform token info:id = "ND_texcoord_vector2"
+            float2 outputs:out
+        }
+
+        # 缩放向量 (sclX, sclY)
+        def Shader "ScaleVec"
+        {
+            uniform token info:id = "ND_combine2_vector2"
+            float inputs:in1.connect = </Root/Material.inputs:sclX>
+            float inputs:in2.connect = </Root/Material.inputs:sclY>
+            float2 outputs:out
+        }
+
+        # 缩放后的 UV = texcoord * scale
+        def Shader "ScaledUV"
+        {
+            uniform token info:id = "ND_multiply_vector2"
+            float2 inputs:in1.connect = </Root/Material/Texcoord.outputs:out>
+            float2 inputs:in2.connect = </Root/Material/ScaleVec.outputs:out>
+            float2 outputs:out
+        }
+
+        # 按当前眼选 U 偏移:左眼 offLX / 右眼 offRX(mono 取左)
+        def Shader "EyeOffsetX"
+        {
+            uniform token info:id = "ND_realitykit_geometry_switch_cameraindex_float"
+            float inputs:left.connect = </Root/Material.inputs:offLX>
+            float inputs:right.connect = </Root/Material.inputs:offRX>
+            float inputs:mono.connect = </Root/Material.inputs:offLX>
+            float outputs:out
+        }
+
+        # 按当前眼选 V 偏移
+        def Shader "EyeOffsetY"
+        {
+            uniform token info:id = "ND_realitykit_geometry_switch_cameraindex_float"
+            float inputs:left.connect = </Root/Material.inputs:offLY>
+            float inputs:right.connect = </Root/Material.inputs:offRY>
+            float inputs:mono.connect = </Root/Material.inputs:offLY>
+            float outputs:out
+        }
+
+        # 偏移向量 (offX, offY)
+        def Shader "OffsetVec"
+        {
+            uniform token info:id = "ND_combine2_vector2"
+            float inputs:in1.connect = </Root/Material/EyeOffsetX.outputs:out>
+            float inputs:in2.connect = </Root/Material/EyeOffsetY.outputs:out>
+            float2 outputs:out
+        }
+
+        # 最终 UV = 缩放UV + 眼偏移
+        def Shader "FinalUV"
+        {
+            uniform token info:id = "ND_add_vector2"
+            float2 inputs:in1.connect = </Root/Material/ScaledUV.outputs:out>
+            float2 inputs:in2.connect = </Root/Material/OffsetVec.outputs:out>
+            float2 outputs:out
+        }
+
+        # 采样视频纹理
+        def Shader "Image"
+        {
+            uniform token info:id = "ND_image_color3"
+            asset inputs:file.connect = </Root/Material.inputs:videoTexture>
+            float2 inputs:texcoord.connect = </Root/Material/FinalUV.outputs:out>
+            color3f outputs:out
+        }
+
+        # Unlit 输出(关 tone map —— ADR 0004 色彩契约)
+        def Shader "UnlitSurface"
+        {
+            uniform token info:id = "ND_realitykit_unlit_surfaceshader"
+            color3f inputs:color.connect = </Root/Material/Image.outputs:out>
+            bool inputs:applyPostProcessToneMap = 0
+            bool inputs:hasPremultipliedAlpha = 0
+            float inputs:opacity = 1
+            token outputs:out
+        }
+    }
+}

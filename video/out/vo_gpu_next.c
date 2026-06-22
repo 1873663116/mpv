@@ -1099,6 +1099,7 @@ static enum xr_target xr_acquire_render_target(struct vo *vo, struct priv *p, pl
 
     extern pl_tex xr_resident_back_tex(struct mp_log *log, pl_gpu gpu, int w, int h, uint32_t *out_id);
     extern bool xr_resident_external_size(int *w, int *h);
+    extern bool xr_resident_target_is_srgb(void);
     int rw = 0, rh = 0;
     if (!xr_resident_external_size(&rw, &rh)) {
         // 启用了出口但没配置外部 IOSurface,回落到视频尺寸、内部自建缓冲。
@@ -1124,30 +1125,33 @@ static enum xr_target xr_acquire_render_target(struct vo *vo, struct priv *p, pl
     pl_tex rtex = xr_resident_back_tex(vo->log, gpu, rw, rh, out_back_id);
     if (!rtex)
         return XR_TARGET_DROP;
+    // [xr] 出口传递曲线随像素格式路由(ADR 0004/0005):
+    //   fp16(HDR)= 扩展线性 Display P3,承载 >1.0 线性光 → 消费端 EDR 直采;
+    //   8-bit(SDR)= IEC sRGB 编码 Display P3,libplacebo 在 shader 里按此 transfer 编码字节,
+    //   消费端以 `.rgba8Unorm_srgb` 视图硬件解码,严格互逆。格式由 Swift 端按源 HDR 与否路由。
     *swframe = (struct pl_swapchain_frame){
         .fbo = rtex,
         .flipped = false,
         .color_repr = pl_color_repr_rgb,
-        // [xr] HDR 出口契约(ADR 0005):渲染目标 = 扩展线性 Display P3。fp16 可承载
-        // >1.0 的线性光 → 消费端以 extendedLinearDisplayP3 + .hdrColor 采样为 EDR。
-        // 传递/原色/峰值由 target-* 选项精确驱动;此处给出与之一致的基底。
         .color_space = (struct pl_color_space){
             .primaries = PL_COLOR_PRIM_DISPLAY_P3,
-            .transfer  = PL_COLOR_TRC_LINEAR,
+            .transfer  = xr_resident_target_is_srgb() ? PL_COLOR_TRC_SRGB
+                                                      : PL_COLOR_TRC_LINEAR,
         },
     };
     return XR_TARGET_READY;
 }
 
-// [xr] 发布:完成屏障保证写入结束 → 把后台缓冲发布为 front(门①双缓冲,ADR 0003)。
-// 注:仍是 pl_gpu_finish 全停屏障,异步跨设备 fence + 三缓冲是后续优化(ADR 0009/0010)。
+// [xr] 发布(三缓冲流水线,ADR 0011):提交本帧渲染(非阻塞 flush),并发布「上一帧」缓冲——
+// 此刻它的 GPU 写入几乎必然已完成,xr_resident 内部只对它做 pl_tex_poll、不抽干队列,故本帧
+// 渲染与 RealityKit 消费并行推进。取代旧的每帧 pl_gpu_finish 全停(门①双缓冲,ADR 0003)。
 static void xr_publish_render_target(pl_gpu gpu, bool surfaceless, uint32_t back_id)
 {
+    (void)back_id; // 发布的是上一帧缓冲,其 IOSurfaceID 由 xr_resident 内部记账,不再由此传入
     if (!surfaceless)
         return;
-    extern void xr_resident_publish_front(uint32_t iosurface_id);
-    pl_gpu_finish(gpu);
-    xr_resident_publish_front(back_id);
+    extern void xr_resident_submit_back(pl_gpu gpu);
+    xr_resident_submit_back(gpu);
 }
 #endif
 

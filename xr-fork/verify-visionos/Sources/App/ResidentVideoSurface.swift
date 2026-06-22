@@ -7,82 +7,127 @@ import Metal
 import RealityKit
 import UniformTypeIdentifiers
 
-/// 门① 双缓冲:持有 2 张 IOSurface(写/读环)。mpv 在两张间交替写后台缓冲、
-/// 写完发布为 front;消费侧按 mpv 发布的 front IOSurfaceID 取对应 TextureResource 给 RealityKit。
+/// 门① 三缓冲:持有 3 张 IOSurface(写/读环,ADR 0011)。mpv 轮流写后台缓冲、延迟一帧发布 front;
+/// 消费侧按 mpv 发布的 front IOSurfaceID 取对应 TextureResource 给 RealityKit。三张让「正写 /
+/// 待发布 / 消费中」互不重叠 → C 侧得以用 pl_gpu_flush + pl_tex_poll 取代每帧 pl_gpu_finish 全停。
 ///
-/// visionOS 移植说明(与 macOS verify 唯一差异):不引入 AppKit。零拷贝包装 API
-/// `TextureResource.__texture(from:)` 经 xros SDK typecheck 确认可用,路径与 macOS 一致。
+/// visionOS 出口走**公有零拷贝** API(vOS27):`LowLevelDeviceResource(textureDescriptor:iosurface:plane:)`
+/// 把 mpv 的 IOSurface 就地导入,`LowLevelTexture` + `TextureResource(from:)` 给材质,换帧用
+/// `LLT.replace(deviceResource:)` 指针级切换(取代私有 `__texture(from:)`,以便上架)。不引入 AppKit。
+/// [xr-perf 杠杆2] 出口像素格式路由(Phase 1,见 ADR 0004/0005)。按源 HDR 与否选最省带宽的格式:
+///   `.sdr8`  = 8-bit sRGB(Display P3),4 字节/px —— SDR 专用,带宽腰斩,零画质损失;
+///   `.hdr16` = fp16 扩展线性(Display P3),8 字节/px —— HDR EDR(承载 >1.0 线性光),真机调好的默认。
+/// (Phase 2 将加 `.hdr10pq`:10-bit PQ + 消费端 ShaderGraph 解码,把 HDR 带宽也腰斩。)
+enum XRColorRoute: String, CaseIterable {
+    case sdr8
+    case hdr16
+
+    var bytesPerPixel: Int { self == .sdr8 ? 4 : 8 }
+    /// IOSurface 像素格式(与 C 侧 xr_resident_texture.m 的 XR_PIXFMT_* 对齐)。
+    var iosurfacePixelFormat: OSType { self == .sdr8 ? kCVPixelFormatType_32RGBA
+                                                     : kCVPixelFormatType_64RGBAHalf }
+    /// 消费端 Metal 视图:8-bit 用 `_srgb` 变体 → 采样时 GPU 自动解 sRGB→线性(与 C 写入侧的
+    /// plain rgba8Unorm + libplacebo sRGB 编码严格互逆);fp16 直采线性。
+    var metalConsumerFormat: MTLPixelFormat { self == .sdr8 ? .rgba8Unorm_srgb : .rgba16Float }
+    var label: String { self == .sdr8 ? "8-bit sRGB" : "fp16 线性" }
+}
+
+/// 路由模式(调参开关):自动按源元数据选,或手动强制。
+enum XRRouteMode: String, CaseIterable {
+    case auto
+    case forceSDR
+    case forceHDR
+    var label: String { self == .auto ? "自动" : (self == .forceSDR ? "强制 SDR 8-bit" : "强制 HDR fp16") }
+}
+
 @MainActor
 final class ResidentVideoSurface {
     let width: Int
     let height: Int
-    static let bufferCount = 2
+    let route: XRColorRoute
+    static let bufferCount = 3
 
     struct Buffer {
         let iosurface: IOSurfaceRef
         let id: UInt32
-        let metalTexture: any MTLTexture
-        let textureResource: TextureResource
+        // 同一张 IOSurface 的两个 LLDR 实例:换帧时交替使用 —— RK 把「同实例 replace」当 no-op,
+        // 换实例才触发重读(Apple『Displaying low-latency connected video』样例同款机制)。
+        let deviceResA: LowLevelDeviceResource
+        let deviceResB: LowLevelDeviceResource
     }
 
     let buffers: [Buffer]
+    /// 零拷贝零换材质契约:**一个** LLT + **一张** TextureResource 始终绑给材质;换帧只对 LLT 调
+    /// `replace(deviceResource:)` 切到 front 那张 IOSurface(见 presentFront)。
+    let lowLevelTexture: LowLevelTexture
+    let textureResource: TextureResource
+    /// 当前已 present 的 IOSurfaceID + 交替计数(保证每次 replace 用不同 LLDR 实例 → RK 必重读)。
+    private var presentedID: UInt32 = 0
+    private var toggle = 0
 
     var iosurfaceIDs: [UInt32] { buffers.map(\.id) }
 
-    init(width: Int = 1280, height: Int = 720) throws {
+    init(width: Int = 1280, height: Int = 720, route: XRColorRoute = .hdr16) throws {
         self.width = width
         self.height = height
+        self.route = route
 
-        guard let device = MTLCreateSystemDefaultDevice() else {
-            throw VerifyError("MTLCreateSystemDefaultDevice failed")
-        }
+        #if targetEnvironment(simulator)
+        // LLDR 零拷贝(共享纹理)在 visionOS 模拟器不可用(Apple 样例明示),且模拟器本就渲染不了 MoltenVK。
+        throw VerifyError("LowLevelDeviceResource 零拷贝路径不支持模拟器,请用真机")
+        #else
+        // 消费端纹理视图格式:8-bit 用 _srgb(GPU 自动解 sRGB→线性,与写入侧编码互逆);fp16 直采线性。
+        // 这份描述符既给每张 IOSurface 的 LLDR 导入,也与下方 LLT 描述符同格式。
+        let descriptor = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: route.metalConsumerFormat, width: width, height: height, mipmapped: false)
+        descriptor.usage = [.shaderRead]
+        descriptor.storageMode = .shared
 
         var made: [Buffer] = []
         for index in 0..<Self.bufferCount {
-            // HDR 出口(ADR 0005):fp16 RGBA(每像素 8 字节)承载「扩展线性 Display P3」。
-            // mpv 经 libplacebo 把 HDR10 源 tone-map 进 EDR headroom(参考白=1.0,峰值≤~2.0)
-            // 写进这张 IOSurface;>1.0 的线性光即 HDR。kCVPixelFormatType_64RGBAHalf 与 C 侧
-            // (xr_resident_texture.m)创建的内部回落格式一致,两侧都以 .rgba16Float 包装同一面。
+            // fp16(8B/px)= 扩展线性 Display P3 承载 HDR(>1.0 线性光);8-bit(4B/px)= IEC sRGB,SDR。
+            // 与 C 侧(xr_resident_texture.m)创建的格式一致,两侧包同一面。
             let properties: [CFString: Any] = [
                 kIOSurfaceWidth: width,
                 kIOSurfaceHeight: height,
-                kIOSurfaceBytesPerElement: 8,
-                kIOSurfacePixelFormat: kCVPixelFormatType_64RGBAHalf,
+                kIOSurfaceBytesPerElement: route.bytesPerPixel,
+                kIOSurfacePixelFormat: route.iosurfacePixelFormat,
             ]
             guard let iosurface = IOSurfaceCreate(properties as CFDictionary) else {
                 throw VerifyError("IOSurfaceCreate[\(index)] failed")
             }
-
-            // rgba16Float 是线性浮点格式(无 _srgb 变体):字节即扩展线性光,采样不做 EOTF 解码。
-            // ⚠️ 限制(SDK 实测):零拷贝路径 TextureResource.__texture(from:) 只吃 MTLTexture,
-            // 不接受 CreateOptions/semantic,故无法显式打 `.hdrColor` 语义;visionOS 也无
-            // RealityView EDR 开关(沉浸内容由合成器自动按扩展线性 Display P3 合成)。
-            // 因此 HDR 与否的唯一信号就是这里的 .rgba16Float 浮点格式 + >1.0 的线性值。详见 ADR 0005。
-            let descriptor = MTLTextureDescriptor.texture2DDescriptor(
-                pixelFormat: .rgba16Float,
-                width: width,
-                height: height,
-                mipmapped: false
-            )
-            descriptor.usage = [.renderTarget, .shaderRead]
-            descriptor.storageMode = .shared
-
-            guard let metalTexture = device.makeTexture(
-                descriptor: descriptor,
-                iosurface: iosurface,
-                plane: 0
-            ) else {
-                throw VerifyError("MTLDevice.makeTexture(iosurface:)[\(index)] failed")
-            }
-
-            made.append(Buffer(
-                iosurface: iosurface,
-                id: IOSurfaceGetID(iosurface),
-                metalTexture: metalTexture,
-                textureResource: TextureResource.__texture(from: metalTexture)
-            ))
+            // 同一张 IOSurface 建两个 LLDR 实例,换帧交替使用(承重机制见 Buffer 注释)。
+            let a = try LowLevelDeviceResource(textureDescriptor: descriptor, iosurface: iosurface, plane: 0)
+            let b = try LowLevelDeviceResource(textureDescriptor: descriptor, iosurface: iosurface, plane: 0)
+            made.append(Buffer(iosurface: iosurface, id: IOSurfaceGetID(iosurface),
+                               deviceResA: a, deviceResB: b))
         }
         buffers = made
+
+        // 一个 LLT(描述符与消费视图格式一致)+ 一个 TextureResource;初始指向 buffers[0]。
+        let lltDescriptor = LowLevelTexture.Descriptor(
+            pixelFormat: route.metalConsumerFormat, width: width, height: height,
+            depth: 1, mipmapLevelCount: 1, textureUsage: [.shaderRead])
+        let llt = try LowLevelTexture(descriptor: lltDescriptor)
+        llt.replace(deviceResource: made[0].deviceResA)
+        self.lowLevelTexture = llt
+        self.textureResource = try TextureResource(from: llt)
+        // 初始 0(非 buffers[0].id):生产端首发 front 恰是 buffers[0],设 0 让首帧也必触发一次 replace
+        // 重读真内容,而非停在 init 时的空纹理。
+        self.presentedID = 0
+        #endif
+    }
+
+    /// 换帧(@MainActor,零拷贝、指针级):把 LLT 切到 front 那张 IOSurface。front 未变返回 false。
+    /// 写完同步由生产端保证(front 仅在 pl_tex_poll 确认写完后才发布),故无需 command buffer。
+    /// 每次交替用该缓冲的两个 LLDR 实例,确保 RK 必重读(同实例 = no-op)。
+    @discardableResult
+    func presentFront(_ id: UInt32) -> Bool {
+        guard id != presentedID, let buf = buffers.first(where: { $0.id == id }) else { return false }
+        toggle &+= 1
+        lowLevelTexture.replace(deviceResource: (toggle & 1 == 0) ? buf.deviceResA : buf.deviceResB)
+        presentedID = id
+        return true
     }
 
     func buffer(forID id: UInt32) -> Buffer? {
